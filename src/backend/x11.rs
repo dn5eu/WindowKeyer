@@ -258,7 +258,7 @@ impl WindowBackend for X11Backend {
         // KORREKTUR: Die Event-Maske des Root-Fensters wird vom Server ersetzt, nicht
         // addiert — daher müssen alle Masken in EINER Änderung gesetzt werden.
         let _ = conn.change_window_attributes(root, &ChangeWindowAttributesAux::new()
-            .event_mask(EventMask::KEY_PRESS_MASK | EventMask::KEY_RELEASE_MASK
+            .event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE
                 | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE));
         let _ = conn.flush();
 
@@ -274,10 +274,12 @@ impl WindowBackend for X11Backend {
 
     fn stop_events(&self) {
         self.running.store(false, Ordering::Relaxed);
-        // KORREKTUR: Grab-/Event-Connection explizit schließen, sonst wartet der
-        // Event-Thread in poll_for_event() ewig und handle.join() deadlockt beim Beenden.
+        // KORREKTUR: RustConnection (x11rb 0.13) hat kein disconnect() — der
+        // Event-Thread beendet sich selbst über das running-Flag (poll_for_event
+        // ist hier eh ein nicht-blockierendes Polling mit 20ms-Sleep), danach
+        // wird die Connection durch Drop des Arcs geschlossen.
         if let Some(conn) = self.grab_conn.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = conn.disconnect();
+            let _ = conn.flush();
         }
         if let Some(handle) = self.event_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = handle.join();
