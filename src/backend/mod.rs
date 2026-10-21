@@ -25,7 +25,10 @@ pub enum BackendEvent {
     WindowsChanged,
     WindowClosed(WindowId),
     BackendLost(String),
-    KeyPress(u8, u16), // keycode, modifiers
+    KeyPress(u8, u16), // keycode, modifiers (nur X11-Backend)
+    /// Phase 3a: KDE-Wayland-Backend löst Hotkeys über KWin GlobalShortcuts
+    /// aus; die zugeordnete Fenster-ID wird hierdurch gemeldet.
+    ShortcutTriggered(WindowId),
 }
 
 pub trait WindowBackend: Send + Sync {
@@ -43,4 +46,17 @@ pub trait WindowBackend: Send + Sync {
     fn create_shortcut(&self, display_text: String, keycode: u8, modifiers: u16) -> Result<Shortcut, BackendError>;
     fn grab_hotkey(&self, shortcut: &Shortcut) -> Result<(), BackendError>;
     fn ungrab_hotkey(&self, shortcut: &Shortcut) -> Result<(), BackendError>;
+
+    /// Grab mit bekannter Ziel-Fenster-ID. Backends, die Auslösungen selbst
+    /// mappen müssen (KDE-Wayland via KWin GlobalShortcuts), überschreiben
+    /// diese Methode; X11 ignoriert die ID und nutzt das KeyPress-Event.
+    fn grab_hotkey_for_window(&self, shortcut: &Shortcut, _window_id: WindowId) -> Result<(), BackendError> {
+        self.grab_hotkey(shortcut)
+    }
+
+    /// true wenn das Backend Hotkey-Events über `BackendEvent::KeyPress`
+    /// (X11-Keycode + Modifier-Maske) liefert. false z.B. beim KDE-Wayland-
+    /// Backend, das stattdessen benannte Shortcuts über KWin GlobalShortcuts
+    /// nutzt und Auslösungen als `BackendEvent::ShortcutTriggered(id)` meldet.
+    fn uses_x11_keycodes(&self) -> bool { true }
 }

@@ -41,7 +41,7 @@ impl HotkeyManager {
 			}
 		}
 
-		backend.grab_hotkey(&shortcut)?;
+		backend.grab_hotkey_for_window(&shortcut, window_id)?;
 
 		self.window_bindings
 		.entry(window_id)
