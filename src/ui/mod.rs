@@ -197,9 +197,14 @@ fn capture_hotkey(parent: &impl gtk4::prelude::IsA<gtk4::Window>, window_title: 
     window.add_controller(esc_controller);
 
     let controller = gtk4::EventControllerKey::new();
+    // KORREKTUR: In gtk4 0.9 liefert connect_key_released eine Closure, deren
+    // Callback (u32, u32, ModifierType) -> () zurueckgeben muss — die
+    // Propagation-Rueckgabe gibt es erst ab gtk4 0.10. Der Rueckgabewert ist hier
+    // ohnehin wirkungslos: Die Hotkey-Erkennung laeuft in einem eigenen modalen
+    // Fenster mit lokalem MainLoop und stoppt die Aufnahme ueber main_loop.quit().
     controller.connect_key_released(move |_controller, keyval, keycode, state| {
         if keyval == Key::Escape || is_modifier_only(keyval) {
-            return glib::Propagation::Proceed;
+            return;
         }
 
         let display_text = format_keyval_state(keyval, state);
@@ -214,7 +219,6 @@ fn capture_hotkey(parent: &impl gtk4::prelude::IsA<gtk4::Window>, window_title: 
                 status.set_text("Ungültige Taste oder Kombination.");
             }
         }
-        glib::Propagation::Stop
     });
     window.add_controller(controller);
 
@@ -381,15 +385,18 @@ pub fn build_ui(app: &Application, backend: Arc<dyn WindowBackend>, session: Ses
     // KORREKTUR: Der Polling-Timer wird an das Fenster gehängt und beim Destroy
     // automatisch entfernt. Vorher lief bei jeder Re-Aktivierung (z.B. Tray-Klick
     // nach Fenster-Schließen) ein alter Timer weiter, der ins Leere pollte.
+    // In glib 0.20 wird der Source über SourceId::remove(self) entfernt
+    // (id.destroy() existiert nicht mehr).
     let state_for_destroy = Rc::clone(&state);
     window.connect_destroy(move |_| {
         if let Some(id) = state_for_destroy.poll_source_id.take() {
-            id.destroy();
+            id.remove();
         }
     });
-    { let state = Rc::clone(&state);
+    { let state_for_timer = Rc::clone(&state);
+      let state = Rc::clone(&state);
       let id = glib::timeout_add_local(Duration::from_millis(300), move || { state.poll(); glib::ControlFlow::Continue });
-      state.poll_source_id.set(Some(id)); }
+      state_for_timer.poll_source_id.set(Some(id)); }
     { let commands_tx = commands_tx.clone(); refresh_button.connect_clicked(move |_| { let _ = commands_tx.send(UiCommand::Refresh); }); }
 
     let window_for_close = window.clone();

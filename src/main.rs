@@ -60,6 +60,9 @@ fn main() {
             // Timer mit eigenem Receiver-Klon erzeugt, der mit dem ersten um die
             // Befehle konkurrierte. Die KSNI-TrayService-Instanz wird ebenfalls nur
             // einmal gestartet (identische D-Bus-Namen führen sonst zu Konflikten).
+            // KORREKTUR: In glib 0.20 liefert timeout_add_local eine Closure, die
+            // ControlFlow zurueckgibt — zum Entfernen des Sources dient
+            // glib::Source::remove(&id) (id.destroy() existiert nicht mehr).
             let tray_source_id = std::rc::Rc::new(std::cell::RefCell::new(None::<glib::SourceId>));
             let tray_ready = std::rc::Rc::new(std::cell::Cell::new(false));
 
@@ -94,7 +97,7 @@ fn main() {
                     let source_slot = std::rc::Rc::clone(&tray_source_id);
                     app.connect_shutdown(move |_| {
                         if let Some(source_id) = source_slot.borrow_mut().take() {
-                            source_id.destroy();
+                            source_id.remove();
                         }
                     });
                     *tray_source_id.borrow_mut() = Some(glib::timeout_add_local(
@@ -115,7 +118,7 @@ fn main() {
                             }
                             glib::ControlFlow::Continue
                         },
-                    )));
+                    ));
                 }
             });
 
