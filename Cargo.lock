@@ -920,6 +920,7 @@ name = "windowkeyer"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "dbus",
  "glib",
  "gtk4",
  "ksni",
