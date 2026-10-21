@@ -27,8 +27,10 @@ pub enum BackendEvent {
     BackendLost(String),
     KeyPress(u8, u16), // keycode, modifiers (nur X11-Backend)
     /// Phase 3a: KDE-Wayland-Backend löst Hotkeys über KWin GlobalShortcuts
-    /// aus; die zugeordnete Fenster-ID wird hierdurch gemeldet.
-    ShortcutTriggered(WindowId),
+    /// aus; KWin meldet im activated()-Signal den Shortcut-/Action-Namen,
+    /// nicht die Fenster-ID. Die UI Auflösung erfolgt über
+    /// WindowBackend::resolve_shortcut_trigger.
+    ShortcutTriggered(String),
 }
 
 pub trait WindowBackend: Send + Sync {
@@ -59,4 +61,9 @@ pub trait WindowBackend: Send + Sync {
     /// Backend, das stattdessen benannte Shortcuts über KWin GlobalShortcuts
     /// nutzt und Auslösungen als `BackendEvent::ShortcutTriggered(id)` meldet.
     fn uses_x11_keycodes(&self) -> bool { true }
+
+    /// Phase 3a: Löst den in `ShortcutTriggered` gemeldeten Namen zur
+    /// Ziel-Fenster-ID auf. Nur für Backends relevant, die Auslösungen
+    /// namenbasiert melden (KDE Wayland); Standard: keine Auflösung.
+    fn resolve_shortcut_trigger(&self, _name: &str) -> Option<WindowId> { None }
 }

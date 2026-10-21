@@ -312,6 +312,17 @@ impl UiState {
                             request_activate(&self.backend, &self.commands_tx, window_id);
                         }
                     }
+                    // Phase 3a (KDE Wayland): KWin meldet den Shortcut-/Action-
+                    // Namen aus dem activated()-Signal; das Backend löst daraus
+                    // die Ziel-Fenster-ID auf.
+                    BackendEvent::ShortcutTriggered(name) => {
+                        if let Some(window_id) = self.backend.resolve_shortcut_trigger(&name) {
+                            debugln!("[UI] Shortcut '{name}' -> Fenster 0x{window_id:x}");
+                            request_activate(&self.backend, &self.commands_tx, window_id);
+                        } else {
+                            debugln!("[UI] Shortcut-Trigger '{name}' ohne bekanntes Fenster ignoriert");
+                        }
+                    }
                     BackendEvent::BackendLost(msg) => { status_message = Some(format!("Verbindung verloren: {msg}")); refresh = true; }
                 }
             }

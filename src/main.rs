@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use backend::detection::{detect_session, select_backend_name};
+use backend::kde_wayland::KdeWaylandBackend;
 use backend::x11::X11Backend;
 use backend::WindowBackend;
 use gtk4::prelude::*;
@@ -34,9 +35,18 @@ fn main() {
         match backend_name {
             "kde_wayland" => {
                 debugln!("[windowkeyer] Versuche KDE Plasma Wayland Backend...");
-                X11Backend::new()
-                .map(|b| Arc::new(b) as Arc<dyn WindowBackend>)
-                .map_err(|e| e.to_string())
+                match KdeWaylandBackend::new() {
+                    Ok(b) => Ok(Arc::new(b) as Arc<dyn WindowBackend>),
+                    Err(e) => {
+                        // Graceful Fallback: natives Backend nicht verfügbar
+                        // (z.B. Plasma < mit GlobalShortcutManager oder kein
+                        // D-Bus) → XWayland/X11-Backend verwenden.
+                        debugln!("[windowkeyer] KDE-Wayland-Backend nicht verfügbar ({e}); fallback auf X11/XWayland");
+                        X11Backend::new()
+                            .map(|b| Arc::new(b) as Arc<dyn WindowBackend>)
+                            .map_err(|e2| format!("{e} — X11-Fallback ebenfalls fehlgeschlagen: {e2}"))
+                    }
+                }
             }
             "x11" => X11Backend::new()
             .map(|b| Arc::new(b) as Arc<dyn WindowBackend>)

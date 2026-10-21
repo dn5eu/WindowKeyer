@@ -9,11 +9,12 @@
 //!   `org.freedesktop.DBus.Properties.GetAll` auf Interface
 //!   `org.kde.KWin.Windows`.
 //! * **Globale Hotkeys:** KWin GlobalShortcuts
-//!   (`org.kde.GlobalShortcutManager2`, Plasma >= 6.1). Eine temporäre
-//!   Action-Collection wird beim Start angelegt und im Drop wieder gelöscht.
-//!   Bei Auslösung sendet KWin ein `activated(...)`-Signal an unsere Action,
-//!   das wir als `BackendEvent::ShortcutTriggered(window_id)` weiterreichen —
-//!   das Mapping Shortcut→Fenster liegt komplett in diesem Backend.
+//!   (`/GlobalShortcutManager`, Interface `org.kde.GlobalShortcutManager`).
+//!   Eine temporäre Action-Collection wird beim Start angelegt und im Drop
+//!   wieder gelöscht. Bei Auslösung sendet KWin ein `activated(...)`-Signal
+//!   unserer Action; der Event-Loop liest den Shortcut-/Action-Namen aus dem
+//!   Signal und meldet `BackendEvent::ShortcutTriggered(name)`. Die UI löst
+//!   darüber über `resolve_shortcut_trigger` die Ziel-Fenster-ID auf.
 //! * **WindowClosed-Erkennung:** Polling-Thread (~2 s) vergleicht die
 //!   Fensterpfad-Menge mit dem vorherigen Stand.
 //!
@@ -28,19 +29,27 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use dbus::arg::{RefArg, Variant};
-use dbus::blocking::{Connection, Proxy};
+use dbus::blocking::{Connection, Proxy, SyncConnection};
+use dbus::message::{MatchRule, Message};
 
 use crate::backend::{BackendError, BackendEvent, WindowBackend};
 use crate::models::{Shortcut, WindowId, WindowInfo};
 
 const KWIN_DEST: &str = "org.kde.KWin";
+const GSM_PATH: &str = "/GlobalShortcutManager";
+const GSM_IFACE: &str = "org.kde.GlobalShortcutManager";
 const TIMEOUT: Duration = Duration::from_millis(800);
 
 fn variant_str(v: Option<&Variant<Box<dyn RefArg>>>) -> String {
     v.and_then(|v| v.0.as_str().map(str::to_string)).unwrap_or_default()
 }
 fn variant_bool(v: Option<&Variant<Box<dyn RefArg>>>) -> bool {
-    v.and_then(|v| v.0.get(true)).unwrap_or(false)
+    // dbus 0.9: Box<dyn RefArg> hat keine downcast_ref-Methode; stattdessen
+    // den konkreten Wert aus dem Iterator-Read des inneren RefArg holen.
+    v.and_then(|v| {
+        let bool_ref: &dyn RefArg = &**&v.0;
+        <bool as dbus::arg::Get>::get(bool_ref.get())
+    }).unwrap_or(false)
 }
 
 /// Ein bei KWin registrierter globaler Shortcut (temporär, nur im RAM).
@@ -51,10 +60,10 @@ struct RegisteredShortcut {
 }
 
 pub struct KdeWaylandBackend {
-    conn: Connection,
+    conn: Arc<SyncConnection>,
     wm_name: String,
     collection: String, // ObjectPath der temporären Action-Collection
-    shortcuts: Mutex<HashMap<String, RegisteredShortcut>>, // key: action_path
+    shortcuts: Mutex<HashMap<String, RegisteredShortcut>>, // key: Shortcut-Name
     running: Arc<AtomicBool>,
     event_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -67,7 +76,7 @@ impl KdeWaylandBackend {
         Self::compositor_kind(&conn).as_deref() == Some("wayland-general")
     }
 
-    fn compositor_kind(conn: &Connection) -> Option<String> {
+    fn compositor_kind<C: dbus::blocking::BlockingSender>(conn: &C) -> Option<String> {
         let p = Proxy::new(KWIN_DEST, "/KWin", TIMEOUT, conn);
         let r: Result<(Variant<Box<dyn RefArg>>,), _> = p.method_call(
             "org.freedesktop.DBus.Properties", "Get", ("org.kde.KWin", "compositor"));
@@ -78,14 +87,21 @@ impl KdeWaylandBackend {
     }
 
     pub fn new() -> Result<Self, BackendError> {
-        let conn = Connection::new_session().map_err(|e| BackendError::Connection(e.to_string()))?;
-        let kind = Self::compositor_kind(&conn)
+        let probe = Connection::new_session()
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let kind = Self::compositor_kind(&probe)
             .ok_or_else(|| BackendError::Connection("Kein D-Bus-Zugriff auf org.kde.KWin".into()))?;
         if kind != "wayland-general" {
             return Err(BackendError::Unsupported(format!(
                 "KWin meldet Compositor-Typ '{kind}' — natives Wayland-Backend nur unter Plasma Wayland"
             )));
         }
+        drop(probe);
+        // SyncConnection statt Connection: dbus::blocking::Connection enthält
+        // ein RefCell und ist damit NICHT Sync — unser Backend muss aber
+        // Send + Sync sein (Arc<dyn WindowBackend> lebt in mehreren Threads).
+        let conn = Arc::new(SyncConnection::new_session()
+            .map_err(|e| BackendError::Connection(e.to_string()))?);
         let collection = Self::create_collection(&conn)?;
         debugln!("[KWinDBus] Hotkey-Collection angelegt: {collection}");
         Ok(Self {
@@ -98,25 +114,28 @@ impl KdeWaylandBackend {
         })
     }
 
-    fn create_collection(conn: &Connection) -> Result<String, BackendError> {
-        let mgr = Proxy::new(KWIN_DEST, "/GlobalShortcutManager", TIMEOUT, conn);
-        let r: Result<(dbus::arg::OwnedObjectPath,), _> = mgr.method_call(
-            "org.kde.GlobalShortcutManager2", "newCollection", ("windowkeyer-temp", true));
+    fn create_collection(conn: &SyncConnection) -> Result<String, BackendError> {
+        let mgr = Proxy::new(KWIN_DEST, GSM_PATH, TIMEOUT, conn);
+        // newCollection(s, b) → o (Pfad der neuen Collection). Weicht eine
+        // KWin-Version vom Rückgabetyp ab, hilft die Pfad-Konvention weiter.
+        let r: Result<(dbus::strings::Path<'static>,), _> = mgr.method_call(
+            GSM_IFACE, "newCollection", ("windowkeyer-temp", true));
         match r {
-            Ok((path,)) => Ok(path.0.to_string()),
-            Err(e) => Err(BackendError::Unsupported(format!(
-                "KWin erlaubt keine temporäre Shortcut-Collection (Plasma < 6.1?): {e}"
-            ))),
+            Ok((path,)) => Ok(path.to_string()),
+            Err(e) => {
+                debugln!("[KWinDBus] newCollection-Rückgabe unlesbar ({e}), nutze Pfad-Konvention");
+                Ok(format!("{GSM_PATH}/windowkeyer-temp"))
+            }
         }
     }
 
     /// Fensterpfade von KWin (`windowsList` → Array of ObjectPath).
-    fn window_paths(&self) -> Vec<String> {
-        let p = Proxy::new(KWIN_DEST, "/KWin", TIMEOUT, &self.conn);
-        let reply: Result<(Vec<dbus::arg::OwnedObjectPath>,), _> =
+    fn window_paths<C: dbus::blocking::BlockingSender>(&self, conn: &C) -> Vec<String> {
+        let p = Proxy::new(KWIN_DEST, "/KWin", TIMEOUT, conn);
+        let reply: Result<(Vec<dbus::strings::Path<'static>>,), _> =
             p.method_call("org.kde.KWin", "windowsList", ());
         match reply {
-            Ok(paths) => paths.0.into_iter().map(|p| p.0.to_string()).collect(),
+            Ok(paths) => paths.0.into_iter().map(|p| p.to_string()).collect(),
             Err(e) => { debugln!("[KWinDBus] windowsList fehlgeschlagen: {e}"); Vec::new() }
         }
     }
@@ -130,11 +149,11 @@ impl KdeWaylandBackend {
     }
 
     fn find_path(&self, id: WindowId) -> Option<String> {
-        self.window_paths().into_iter().find(|p| Self::wid_from_path(p) == id)
+        self.window_paths(&*self.conn).into_iter().find(|p| Self::wid_from_path(p) == id)
     }
 
     fn client_props(&self, path: &str) -> Option<HashMap<String, Variant<Box<dyn RefArg>>>> {
-        let p = Proxy::new(KWIN_DEST, path, TIMEOUT, &self.conn);
+        let p = Proxy::new(KWIN_DEST, path, TIMEOUT, &*self.conn);
         let r: Result<(HashMap<String, Variant<Box<dyn RefArg>>>,), _> = p.method_call(
             "org.freedesktop.DBus.Properties", "GetAll", ("org.kde.KWin.Windows",));
         match r { Ok(m) => Some(m.0), Err(_) => None }
@@ -158,7 +177,8 @@ impl KdeWaylandBackend {
     }
 
     /// Übersetzt GTK-Keycode + Modifier-Maske in eine KWin-KeySequence wie
-    /// "Meta+Ctrl+f".
+    /// "Meta+Ctrl+f". Modifier-Maske = X11-Bits (Shift 0x1, Ctrl 0x4,
+    /// Alt 0x8, Super/Mod4 0x40), so wie `create_shortcut` sie liefert.
     fn key_sequence(s: &Shortcut) -> String {
         let mut parts: Vec<String> = Vec::new();
         if s.modifiers & 0x0001 != 0 { parts.push("Shift".into()); }
@@ -182,84 +202,107 @@ impl KdeWaylandBackend {
         let name = format!("wk_{window_id:x}_{:x}_{:x}", shortcut.keycode, shortcut.modifiers);
         debugln!("[KWinDBus] registriere Hotkey '{seq}' -> Fenster {window_id:#x}");
 
-        let coll = Proxy::new(KWIN_DEST, &self.collection, TIMEOUT, &self.conn);
-        let action_path = match coll.method_call::<(dbus::arg::OwnedObjectPath,)>(
-            "org.kde.GlobalShortcutManager2", "addAction", (&name, "", "", ""))
-        {
-            Ok((path,)) => path.0.to_string(),
+        let coll = Proxy::new(KWIN_DEST, &self.collection, TIMEOUT, &*self.conn);
+        // addAction(name s, comment s, category s, icon s) → o (Action-Pfad).
+        let r: Result<(dbus::strings::Path<'static>,), _> = coll.method_call(
+            GSM_IFACE, "addAction", (&name, "Temporärer Windowkeyer-Hotkey", "", ""));
+        let action_path = match r {
+            Ok((path,)) => path.to_string(),
             Err(e) => {
                 debugln!("[KWinDBus] addAction-Rückgabe unlesbar ({e}), nutze Pfad-Konvention");
                 format!("{}/{}", self.collection.trim_end_matches('/'), name)
             }
         };
 
-        let act = Proxy::new(KWIN_DEST, &action_path, TIMEOUT, &self.conn);
-        let r: Result<(), _> = act.method_call("org.kde.Action", "setGlobalShortcut", (&seq,));
-        if r.is_err() {
-            let r2: Result<(), _> = act.method_call("org.kde.Action", "setCustomShortcut", (&seq,));
-            r2.map_err(|e| BackendError::Unsupported(format!("GlobalShortcut '{seq}' setzen: {e}")))?;
+        let act = Proxy::new(KWIN_DEST, &action_path, TIMEOUT, &*self.conn);
+        // setCustomShortcut(s): der Standardweg bei KWin GlobalShortcuts;
+        // setGlobalShortcut existiert nur in älteren/anderen Versionen.
+        let r2: Result<(), _> = act.method_call("org.kde.Action", "setCustomShortcut", (&seq,));
+        if r2.is_err() {
+            let r3: Result<(), _> = act.method_call("org.kde.Action", "setGlobalShortcut", (&seq,));
+            r3.map_err(|e| BackendError::Unsupported(format!("GlobalShortcut '{seq}' setzen: {e}")))?;
         }
 
         let mut guard = self.shortcuts.lock().unwrap_or_else(|e| e.into_inner());
-        // Idempotenz: gleiche Zuweisung erneut → alte Registrierung zuerst entfernen.
-        let old = guard.iter().find(|(_, r)| r.name == name).map(|(p, _)| p.clone());
-        if let Some(old) = old {
+        // Idempotenz: gleicher Name bereits registriert → alte Zuweisung ersetzen.
+        if guard.contains_key(&name) {
             drop(guard);
-            self.unregister_action(&old);
+            self.unregister_action(&name);
             guard = self.shortcuts.lock().unwrap_or_else(|e| e.into_inner());
         }
-        guard.insert(action_path, RegisteredShortcut { name, shortcut: shortcut.clone(), window_id });
+        let entry_name = name.clone();
+        guard.insert(name, RegisteredShortcut { name: entry_name, shortcut: shortcut.clone(), window_id });
         Ok(())
     }
 
-    fn unregister_action(&self, action_path: &str) {
-        let entry = {
-            let mut g = self.shortcuts.lock().unwrap_or_else(|e| e.into_inner());
-            g.remove(action_path)
-        };
-        let Some(entry) = entry else { return };
-        let coll = Proxy::new(KWIN_DEST, &self.collection, TIMEOUT, &self.conn);
-        let _ = coll.method_call::<()>("org.kde.GlobalShortcutManager2", "removeAction", (&entry.name,));
+    fn unregister_action(&self, name: &str) {
+        let existed = self.shortcuts.lock().unwrap_or_else(|e| e.into_inner()).remove(name).is_some();
+        if !existed { return; }
+        let coll = Proxy::new(KWIN_DEST, &self.collection, TIMEOUT, &*self.conn);
+        let _: Result<(), _> = coll.method_call(GSM_IFACE, "removeAction", (name,));
     }
 
-    /// Event-/Polling-Loop:
-    /// 1. D-Bus-Signale `activated()`/`activate()` unserer Actions → Trigger.
-    /// 2. Alle ~2 s Fensterpfade vergleichen → WindowClosed / WindowsChanged.
-    fn spawn_event_loop(self: &Arc<Self>, tx: Sender<BackendEvent>) -> Result<JoinHandle<()>, BackendError> {
-        let backend = Arc::clone(self);
-        let running = Arc::clone(&self.running);
-        let handle = std::thread::spawn(move || {
-            let conn = match Connection::new_session() {
-                Ok(c) => c,
-                Err(e) => { let _ = tx.send(BackendEvent::BackendLost(format!("D-Bus Eventloop: {e}"))); return; }
-            };
-            // path_namespace deckt auch später hinzukommende Actions ab.
-            let ns = backend.collection.trim_end_matches('/');
-            let _ = conn.add_match(&format!("interface='org.kde.Action',member='activated',path_namespace='{ns}'"));
-            let _ = conn.add_match(&format!("interface='org.kde.Action',member='activate',path_namespace='{ns}'"));
+    /// Liest den Shortcut-/Action-Namen aus einem activated()-Signal.
+    /// Je nach KWin-Version sind Signaturvarianten im Umlauf: String-Argument
+    /// (Shortcut-Name), ObjectPath (Action) oder kein Argument (dann hilft
+    /// der Absender-Name des Signals weiter, der die Action selbst ist).
+    fn trigger_name_from_signal(msg: &Message) -> Option<String> {
+        use dbus::arg::ReadAll;
+        if let Ok((s,)) = <(String,) as ReadAll>::read(&mut msg.iter_init()) {
+            if !s.is_empty() { return Some(s); }
+        }
+        if let Ok((p,)) = <(dbus::strings::Path<'static>,) as ReadAll>::read(&mut msg.iter_init()) {
+            let s = p.to_string();
+            // Action-Pfad → Name ist das letzte Pfadsegment.
+            if let Some(last) = s.rsplit('/').next() {
+                if !last.is_empty() { return Some(last.to_string()); }
+            }
+        }
+        msg.sender().map(|b| b.to_string()).filter(|s| !s.is_empty())
+    }
 
+    /// Event-Loop in einem eigenen Thread mit eigener D-Bus-Verbindung:
+    /// 1. Match auf `activated()`/`activate()`-Signale unserer Actions.
+    /// 2. Alle ~2 s Fensterpfade vergleichen → WindowClosed / WindowsChanged.
+    fn spawn_event_loop(
+        collection: String,
+        running: Arc<AtomicBool>,
+        tx: Sender<BackendEvent>,
+    ) -> Result<JoinHandle<()>, BackendError> {
+        let conn = Arc::new(SyncConnection::new_session()
+            .map_err(|e| BackendError::Connection(format!("D-Bus Eventloop: {e}")))?);
+
+        // Match-Rule: interface org.kde.Action, member activated/activate,
+        // path_namespace deckt auch später hinzukommende Actions ab.
+        let ns = collection.trim_end_matches('/').to_string();
+        for member in ["activated", "activate"] {
+            let mut rule: MatchRule<'static> = MatchRule {
+                msg_type: Some(dbus::MessageType::Signal),
+                ..Default::default()
+            };
+            rule.interface = Some(dbus::strings::Interface::from("org.kde.Action"));
+            rule.member = Some(dbus::strings::Member::from(member.to_string()));
+            rule.path = Some(dbus::strings::Path::from(ns.clone()));
+            rule.path_is_namespace = true;
+            let tx2 = tx.clone();
+            let _ = conn.add_match::<(), _>(rule, move |_args: (), _c: &SyncConnection, msg: &Message| {
+                if let Some(name) = KdeWaylandBackend::trigger_name_from_signal(msg) {
+                    debugln!("[KWinDBus] Hotkey-Signal '{member}' für '{name}' empfangen");
+                    let _ = tx2.send(BackendEvent::ShortcutTriggered(name));
+                }
+                true
+            });
+        }
+
+        let handle = std::thread::spawn(move || {
             let mut last_paths: Option<HashSet<String>> = None;
             while running.load(Ordering::Relaxed) {
-                // Signale einsammeln (max ~1.9 s pro Runde blockierend).
-                let deadline = std::time::Instant::now() + Duration::from_millis(1900);
-                while std::time::Instant::now() < deadline {
-                    match conn.receive_with_reply(Duration::from_millis(100)) {
-                        Ok(msg) => {
-                            let member = msg.member().map(|m| m.to_string()).unwrap_or_default();
-                            if member != "activated" && member != "activate" { continue; }
-                            let path = msg.path().to_string_lossy().to_string();
-                            let guard = backend.shortcuts.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(entry) = guard.get(&path) {
-                                debugln!("[KWinDBus] Hotkey ausgelöst: {} -> {:#x}", entry.name, entry.window_id);
-                                let _ = tx.send(BackendEvent::ShortcutTriggered(entry.window_id));
-                            }
-                        }
-                        Err(_) => break, // Timeout o. ä. → weiter mit Polling
-                    }
-                }
+                // Eingehende Signale verarbeiten (blockiert max. 2 s pro Runde
+                // und ruft dabei die add_match-Callbacks auf).
+                let _ = conn.process(Duration::from_millis(2000));
 
                 // Fensterliste pollen.
-                let paths: HashSet<String> = backend.window_paths().into_iter().collect();
+                let paths: HashSet<String> = poll_window_paths(&*conn).into_iter().collect();
                 if let Some(prev) = &last_paths {
                     for gone in prev.difference(&paths) {
                         let id = KdeWaylandBackend::wid_from_path(gone);
@@ -275,60 +318,15 @@ impl KdeWaylandBackend {
     }
 }
 
-/// Keycode → Keysym: versucht eine X-Verbindung (XWayland läuft unter
-/// Plasma-Wayland fast immer), sonst Fallback auf eine statische
-/// Standard-XKB-QWERTY-US-Keymap.
-fn keycode_to_keysym(keycode: u8) -> Option<u32> {
-    use x11rb::protocol::xproto::ConnectionExt as _;
-    if std::env::var_os("DISPLAY").is_some() {
-        if let Ok((conn, _)) = x11rb::connect(None) {
-            if let Ok(kbd) = conn.key_mapping().and_then(|c| c.reply()) {
-                let idx = keycode.checked_sub(kbd.first_keycode)? as usize;
-                if let Some(row) = kbd.keysyms.get(idx) {
-                    if let Some(sym) = row.get(0).copied() {
-                        if sym != 0 { return Some(sym); }
-                    }
-                }
-            }
-        }
+/// windowsList auf einer beliebigen BlockingSender-Verbindung (auch die
+/// Event-Loop-Verbindung braucht das, ohne Zugriff auf die Backend-Instanz).
+fn poll_window_paths<C: dbus::blocking::BlockingSender>(conn: &C) -> Vec<String> {
+    let p = Proxy::new(KWIN_DEST, "/KWin", TIMEOUT, conn);
+    let reply: Result<(Vec<dbus::strings::Path<'static>>,), _> = p.method_call("org.kde.KWin", "windowsList", ());
+    match reply {
+        Ok(paths) => paths.0.into_iter().map(|p| p.to_string()).collect(),
+        Err(e) => { debugln!("[KWinDBus] windowsList (Poll) fehlgeschlagen: {e}"); Vec::new() }
     }
-    FALLBACK_KEYMAP.get(keycode as usize).copied().filter(|s| *s != 0)
-}
-
-/// Standard-XKB-QWERTY-US-Keymap ab KeyCode 8 (Ausschnitt bis KeyCode 134).
-const FALLBACK_KEYMAP: &[u32] = &[
-    /* 0..8 */  0, 0, 0, 0, 0, 0, 0, 0,
-    /* 8 */     0xff08, 0xff09, 0xff0d, 0xff13,             // BackSpace Tab Return Pause
-    /* 12 */    0, 0xff50, 0xff80, 0xff81, 0xff82, 0xff83, 0xff84, 0xff85, 0xff86, 0xff87,
-    /* 22 */    0xff08, 0xff09, 0x71, 0x77, 0x65, 0x72, 0x74, 0x79, 0x75, 0x69,
-    /* 32 */    0x6f, 0x70, 0xff0b, 0xff0d, 0xffe3, 0x61, 0x73, 0x64, 0x66, 0x67,
-    /* 42 */    0x68, 0x6a, 0x6b, 0x6c, 0x3b, 0x27, 0x60, 0xffe1, 0x5c, 0x7a,
-    /* 52 */    0x78, 0x63, 0x76, 0x62, 0x6e, 0x6d, 0x2c, 0x2e, 0x2f, 0xffe2,
-    /* 62 */    0xffaa, 0xffea, 0x20, 0xffe5, 0xffbe, 0xffbf, 0xffc0, 0xffc1, 0xffc2, 0xffc3,
-    /* 72 */    0xffc4, 0xffc5, 0xffc6, 0xffc7, 0xffc8, 0xffc9, 0xffca, 0xffcb, 0xffcc, 0xffcd, 0xffce, 0xffcf,
-    /* 84 */    0xffd0, 0xffd1, 0xffd2, 0xffd3, 0xffd4, 0xffd5,
-];
-
-/// Keysym → KWin-Name. Druckbare ASCII-Symbole entsprechen ihrem Codepoint.
-fn keysym_name(sym: u32) -> Option<String> {
-    if (0x21..=0x7e).contains(&sym) {
-        return Some((sym as u8 as char).to_ascii_lowercase());
-    }
-    const SPECIAL: &[(u32, &str)] = &[
-        (0xff31, "Home"), (0xff32, "Prior"), (0xff33, "Next"), (0xff34, "End"),
-        (0xff36, "Insert"), (0xff37, "Delete"), (0xff08, "Backspace"),
-        (0xff09, "Tab"), (0xff0d, "Return"), (0xff13, "Pause"), (0xff1b, "Escape"),
-        (0xffbe, "F1"), (0xffbf, "F2"), (0xffc0, "F3"), (0xffc1, "F4"), (0xffc2, "F5"),
-        (0xffc3, "F6"), (0xffc4, "F7"), (0xffc5, "F8"), (0xffc6, "F9"), (0xffc7, "F10"),
-        (0xffc8, "F11"), (0xffc9, "F12"), (0xffca, "F13"), (0xffcb, "F14"), (0xffcc, "F15"),
-        (0xffcd, "F16"), (0xffce, "F17"), (0xffcf, "F18"), (0xffd0, "F19"), (0xffd1, "F20"),
-        (0xffd2, "F21"), (0xffd3, "F22"), (0xffd4, "F23"), (0xffd5, "F24"),
-        (0xff51, "Left"), (0xff52, "Up"), (0xff53, "Right"), (0xff54, "Down"),
-        (0xffe1, "Shift"), (0xffe2, "Shift"), (0xffe3, "Control"), (0xffe4, "Control"),
-        (0xffe7, "Meta"), (0xffe8, "Meta"), (0xffe9, "Alt"), (0xffea, "Alt"),
-        (0xffe5, "Caps_Lock"), (0x20, "space"),
-    ];
-    SPECIAL.iter().find(|(s, _)| *s == sym).map(|(_, n)| (*n).to_string())
 }
 
 impl WindowBackend for KdeWaylandBackend {
@@ -336,12 +334,12 @@ impl WindowBackend for KdeWaylandBackend {
     fn window_manager_name(&self) -> &str { &self.wm_name }
 
     fn list_windows(&self) -> Result<Vec<WindowInfo>, BackendError> {
-        Ok(self.window_paths().iter().filter_map(|p| self.info_for(p)).collect())
+        Ok(self.window_paths(&*self.conn).iter().filter_map(|p| self.info_for(p)).collect())
     }
 
     fn activate_window(&self, id: WindowId) -> Result<(), BackendError> {
         let path = self.find_path(id).ok_or(BackendError::NoSuchWindow(id))?;
-        let p = Proxy::new(KWIN_DEST, &path, TIMEOUT, &self.conn);
+        let p = Proxy::new(KWIN_DEST, &path, TIMEOUT, &*self.conn);
         let r: Result<(), _> = p.method_call("org.kde.KWin", "activateWindow", ());
         if r.is_ok() { return Ok(()); }
         // Fallback: Property active=true setzen.
@@ -352,7 +350,7 @@ impl WindowBackend for KdeWaylandBackend {
 
     fn minimize_window(&self, id: WindowId) -> Result<(), BackendError> {
         let path = self.find_path(id).ok_or(BackendError::NoSuchWindow(id))?;
-        let p = Proxy::new(KWIN_DEST, &path, TIMEOUT, &self.conn);
+        let p = Proxy::new(KWIN_DEST, &path, TIMEOUT, &*self.conn);
         let r: Result<(), _> = p.method_call("org.kde.KWin", "requestMinimize", ());
         if r.is_ok() { return Ok(()); }
         let r2: Result<(), _> = p.method_call("org.freedesktop.DBus.Properties", "Set",
@@ -379,17 +377,29 @@ impl WindowBackend for KdeWaylandBackend {
     fn ungrab_hotkey(&self, shortcut: &Shortcut) -> Result<(), BackendError> {
         let targets: Vec<String> = {
             let g = self.shortcuts.lock().unwrap_or_else(|e| e.into_inner());
-            g.iter().filter(|(_, r)| r.shortcut == *shortcut).map(|(p, _)| p.clone()).collect()
+            g.iter().filter(|(_, r)| r.shortcut == *shortcut).map(|(n, _)| n.clone()).collect()
         };
         for t in targets { self.unregister_action(&t); }
         Ok(())
+    }
+
+    /// Löste den Namen aus einem activated()-Signal zur Ziel-Fenster-ID auf.
+    /// Wird von der UI beim BackendEvent::ShortcutTriggered aufgerufen.
+    fn resolve_shortcut_trigger(&self, name: &str) -> Option<WindowId> {
+        let g = self.shortcuts.lock().unwrap_or_else(|e| e.into_inner());
+        // Exakter Treffer (Shortcut-Name aus dem Signal)...
+        if let Some(e) = g.get(name) { return Some(e.window_id); }
+        // ...oder Pfad-Treffer (Signal transportierte den Action-Pfad).
+        g.iter().find(|(n, _)| name.ends_with(&format!("/{n}")) || name.ends_with(&**n))
+            .map(|(_, e)| e.window_id)
     }
 
     fn start_events(&self, tx: Sender<BackendEvent>) -> Result<(), BackendError> {
         let mut guard = self.event_thread.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() { return Ok(()); }
         self.running.store(true, Ordering::Relaxed);
-        let handle = self.spawn_event_loop(tx)?;
+        let handle = Self::spawn_event_loop(
+            self.collection.clone(), Arc::clone(&self.running), tx)?;
         *guard = Some(handle);
         Ok(())
     }
@@ -408,8 +418,69 @@ impl Drop for KdeWaylandBackend {
     fn drop(&mut self) {
         self.stop_events();
         // Temporäre Collection entfernen → alle Hotkeys verschwinden aus KWin.
-        let mgr = Proxy::new(KWIN_DEST, "/GlobalShortcutManager", TIMEOUT, &self.conn);
-        let _ = mgr.method_call::<()>("org.kde.GlobalShortcutManager2", "deleteCollection", (&self.collection,));
+        let mgr = Proxy::new(KWIN_DEST, GSM_PATH, TIMEOUT, &*self.conn);
+        let _: Result<(), _> = mgr.method_call(GSM_IFACE, "deleteCollection", (&self.collection,));
         debugln!("[KWinDBus] Hotkey-Collection entfernt: {}", self.collection);
     }
+}
+
+/// Keycode → Keysym: versucht eine X-Verbindung (XWayland läuft unter
+/// Plasma-Wayland fast immer), sonst Fallback auf eine statische
+/// Standard-XKB-QWERTY-US-Keymap.
+fn keycode_to_keysym(keycode: u8) -> Option<u32> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    if std::env::var_os("DISPLAY").is_some() {
+        if let Ok((conn, _)) = x11rb::connect(None) {
+            if let Ok(cookie) = conn.get_keyboard_mapping(keycode, 1) {
+            if let Ok(kbd) = cookie.reply() {
+                // kbd.keysyms: Vec<u8> — Bytes der Keysym-Werte,
+                // jeweils `keysyms_per_keycode` Stück pro Keycode.
+                let per = kbd.keysyms_per_keycode.max(1) as usize;
+                if let Some(bytes) = kbd.keysyms.chunks(per).next() {
+                    // Erstes 4-Byte-Little-Endian-Bündel = Basis-Keysym
+                    if bytes.len() >= 4 {
+                        let sym = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                        if sym != 0 { return Some(sym); }
+                    }
+                }
+            }
+            }
+        }
+    }
+    FALLBACK_KEYMAP.get(keycode.checked_sub(8)? as usize).copied().filter(|s| *s != 0)
+}
+
+/// Standard-XKB-QWERTY-US-Keymap ab KeyCode 8 (Ausschnitt bis KeyCode 134).
+const FALLBACK_KEYMAP: &[u32] = &[
+    /* 8 */     0xff08, 0xff09, 0xff0d, 0xff13,             // BackSpace Tab Return Pause
+    /* 12 */    0, 0xff50, 0xff80, 0xff81, 0xff82, 0xff83, 0xff84, 0xff85, 0xff86, 0xff87,
+    /* 22 */    0xff08, 0xff09, 0x71, 0x77, 0x65, 0x72, 0x74, 0x79, 0x75, 0x69,
+    /* 32 */    0x6f, 0x70, 0xff0b, 0xff0d, 0xffe3, 0x61, 0x73, 0x64, 0x66, 0x67,
+    /* 42 */    0x68, 0x6a, 0x6b, 0x6c, 0x3b, 0x27, 0x60, 0xffe1, 0x5c, 0x7a,
+    /* 52 */    0x78, 0x63, 0x76, 0x62, 0x6e, 0x6d, 0x2c, 0x2e, 0x2f, 0xffe2,
+    /* 62 */    0xffaa, 0xffea, 0x20, 0xffe5, 0xffbe, 0xffbf, 0xffc0, 0xffc1, 0xffc2, 0xffc3,
+    /* 72 */    0xffc4, 0xffc5, 0xffc6, 0xffc7, 0xffc8, 0xffc9, 0xffca, 0xffcb, 0xffcc, 0xffcd, 0xffce, 0xffcf,
+    /* 84 */    0xffd0, 0xffd1, 0xffd2, 0xffd3, 0xffd4, 0xffd5,
+];
+
+/// Keysym → KWin-Name. Druckbare ASCII-Symbole entsprechen ihrem Codepoint.
+fn keysym_name(sym: u32) -> Option<String> {
+    if (0x21..=0x7e).contains(&sym) {
+        return Some((sym as u8 as char).to_lowercase().to_string());
+    }
+    const SPECIAL: &[(u32, &str)] = &[
+        (0xff31, "Home"), (0xff32, "Prior"), (0xff33, "Next"), (0xff34, "End"),
+        (0xff36, "Insert"), (0xff37, "Delete"), (0xff08, "Backspace"),
+        (0xff09, "Tab"), (0xff0d, "Return"), (0xff13, "Pause"), (0xff1b, "Escape"),
+        (0xffbe, "F1"), (0xffbf, "F2"), (0xffc0, "F3"), (0xffc1, "F4"), (0xffc2, "F5"),
+        (0xffc3, "F6"), (0xffc4, "F7"), (0xffc5, "F8"), (0xffc6, "F9"), (0xffc7, "F10"),
+        (0xffc8, "F11"), (0xffc9, "F12"), (0xffca, "F13"), (0xffcb, "F14"), (0xffcc, "F15"),
+        (0xffcd, "F16"), (0xffce, "F17"), (0xffcf, "F18"), (0xffd0, "F19"), (0xffd1, "F20"),
+        (0xffd2, "F21"), (0xffd3, "F22"), (0xffd4, "F23"), (0xffd5, "F24"),
+        (0xff51, "Left"), (0xff52, "Up"), (0xff53, "Right"), (0xff54, "Down"),
+        (0xffe1, "Shift"), (0xffe2, "Shift"), (0xffe3, "Control"), (0xffe4, "Control"),
+        (0xffe7, "Meta"), (0xffe8, "Meta"), (0xffe9, "Alt"), (0xffea, "Alt"),
+        (0xffe5, "Caps_Lock"), (0x20, "space"),
+    ];
+    SPECIAL.iter().find(|(s, _)| *s == sym).map(|(_, n)| (*n).to_string())
 }
