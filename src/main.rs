@@ -2,6 +2,7 @@
 mod debug;
 mod backend;
 mod hotkey_manager;
+mod icon_loader;
 mod models;
 mod tray;
 mod ui;
