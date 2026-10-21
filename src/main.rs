@@ -55,6 +55,13 @@ fn main() {
             let hotkey_manager = Arc::new(Mutex::new(HotkeyManager::new()));
 
             let (commands_tx, commands_rx) = crossbeam_channel::unbounded::<UiCommand>();
+            // KORREKTUR: Tray-Timer/Receiver nur EINMAL einrichten. Vorher wurde bei
+            // jeder Re-Aktivierung (Tray-Klick nach Fenster-Schließen) ein zweiter
+            // Timer mit eigenem Receiver-Klon erzeugt, der mit dem ersten um die
+            // Befehle konkurrierte. Die KSNI-TrayService-Instanz wird ebenfalls nur
+            // einmal gestartet (identische D-Bus-Namen führen sonst zu Konflikten).
+            let tray_source_id = std::rc::Rc::new(std::cell::RefCell::new(None::<glib::SourceId>));
+            let tray_ready = std::rc::Rc::new(std::cell::Cell::new(false));
 
             app.connect_activate(move |app| {
                 // 1. Hauptfenster erstellen
@@ -66,37 +73,50 @@ fn main() {
                                            commands_tx.clone(),
                 );
 
-                // 2. Natives KDE Tray-Icon starten
-                let tray = WindowkeyerTray {
-                    show_tx: commands_tx.clone(),
-                                 quit_tx: commands_tx.clone(),
-                };
-                let service = ksni::TrayService::new(tray);
-
-                // Startet einen eigenen Hintergrund-Thread für D-Bus, blockiert hier nicht!
-                service.spawn();
-                debugln!("[windowkeyer] KDE Status Notifier Tray gestartet");
-
                 // 3. Tray-Events im GLib Main Loop verarbeiten
-                let commands_rx_clone = commands_rx.clone();
-                let app_clone = app.clone();
+                // KORREKTUR: commands_rx nur einmal bewegen und den Source an das
+                // Application-Signal "shutdown" binden — bei mehrfachem activate
+                // (Tray-Klick nach Fenster schließen) entsteht sonst ein zweiter
+                // Receiver/Timer, der mit dem UI-Poller um die Befehle konkurriert.
+                // Nur beim ersten Aktivieren einrichten: sonst konkurriert bei
+                // Re-Aktivierung ein zweiter Timer um dieselben Befehle.
+                if !tray_ready.get() {
+                    tray_ready.set(true);
+                    let tray_service = ksni::TrayService::new(WindowkeyerTray {
+                        show_tx: commands_tx.clone(),
+                        quit_tx: commands_tx.clone(),
+                    });
+                    tray_service.spawn();
+                    debugln!("[windowkeyer] KDE Status Notifier Tray gestartet");
 
-                glib::timeout_add_local(Duration::from_millis(100), move || {
-                    while let Ok(cmd) = commands_rx_clone.try_recv() {
-                        match cmd {
-                            UiCommand::ShowWindow => {
-                                if let Some(win) = app_clone.active_window() {
-                                    win.present();
+                    let commands_rx_cl = commands_rx.clone();
+                    let app_clone = app.clone();
+                    let source_slot = std::rc::Rc::clone(&tray_source_id);
+                    app.connect_shutdown(move |_| {
+                        if let Some(source_id) = source_slot.borrow_mut().take() {
+                            source_id.destroy();
+                        }
+                    });
+                    *tray_source_id.borrow_mut() = Some(glib::timeout_add_local(
+                        Duration::from_millis(100),
+                        move || {
+                            while let Ok(cmd) = commands_rx_cl.try_recv() {
+                                match cmd {
+                                    UiCommand::ShowWindow => {
+                                        if let Some(win) = app_clone.active_window() {
+                                            win.present();
+                                        }
+                                    }
+                                    UiCommand::Quit => {
+                                        app_clone.quit();
+                                    }
+                                    _ => {}
                                 }
                             }
-                            UiCommand::Quit => {
-                                app_clone.quit();
-                            }
-                            _ => {}
-                        }
-                    }
-                    glib::ControlFlow::Continue
-                });
+                            glib::ControlFlow::Continue
+                        },
+                    )));
+                }
             });
 
             app.run();

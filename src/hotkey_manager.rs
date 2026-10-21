@@ -24,6 +24,15 @@ impl HotkeyManager {
 	) -> Result<Option<Shortcut>, BackendError> {
 		let mut overwritten_shortcut = None;
 
+		// KORREKTUR: Idempotenz — gleicher Shortcut + gleiches Fenster erneut
+		// zugewiesen erzeugt sonst doppelte Einträge in der Rückwärtsliste und
+		// redundante Grabs (Grab-Leak bei mehrfachem "X"-Entfernen/Neuzuweisen).
+		if let Some(existing) = self.window_bindings.get(&window_id) {
+			if existing.contains(&shortcut) {
+				return Ok(None);
+			}
+		}
+
 		if let Some(old_window_id) = self.bindings.insert(shortcut.clone(), window_id) {
 			if old_window_id != window_id {
 				self.remove_from_reverse_map(old_window_id, &shortcut);
@@ -56,10 +65,15 @@ impl HotkeyManager {
 	}
 
 	pub fn find_shortcut(&self, keycode: u8, modifiers: u16) -> Option<WindowId> {
+		// KORREKTUR: !18 war eine decimal-Bitmaske (0b10010) und hat dadurch
+		// Mod1=Alt (0x0008) und Mod4=Super (0x0040) mit maskiert — Alt-/Super-
+		// Hotkeys wurden ignoriert bzw. falsch gematcht. Richtig sind die Lock-Bits:
+		// ShiftLock/CapsLock (0x0002), Lock/NumLock (0x0010), Mod5/ScrollLock (0x2000).
+		const LOCK_MASK: u16 = 0x0002 | 0x0010 | 0x2000;
 		for (shortcut, window_id) in &self.bindings {
 			if shortcut.keycode == keycode {
-				let event_base = modifiers & !18; // Ignoriere CapsLock (2) und NumLock (16)
-				let shortcut_base = shortcut.modifiers & !18;
+				let event_base = modifiers & !LOCK_MASK;
+				let shortcut_base = shortcut.modifiers & !LOCK_MASK;
 				if event_base == shortcut_base {
 					return Some(*window_id);
 				}

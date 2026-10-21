@@ -104,6 +104,7 @@ fn server_time(_conn: &RustConnection) -> u32 { x11rb::CURRENT_TIME }
 
 pub struct X11Backend {
     conn: Arc<RustConnection>,
+    grab_conn: Arc<Mutex<Option<Arc<RustConnection>>>>,
     atoms: Atoms,
     root: Window,
     wm_name: String,
@@ -128,7 +129,12 @@ impl X11Backend {
         let _ = conn.flush();
 
         debugln!("[X11] verbunden: root={root:#010x}, wm={wm_name}");
-        Ok(Self { conn, atoms, root, wm_name, running: Arc::new(AtomicBool::new(false)), event_thread: Mutex::new(None) })
+        Ok(Self { conn, grab_conn: Arc::new(Mutex::new(None)), atoms, root, wm_name, running: Arc::new(AtomicBool::new(false)), event_thread: Mutex::new(None) })
+    }
+
+    fn grab_connection(&self) -> Arc<RustConnection> {
+        self.grab_conn.lock().unwrap_or_else(|e| e.into_inner())
+            .clone().unwrap_or_else(|| Arc::clone(&self.conn))
     }
 
     fn should_skip(&self, win: Window) -> bool {
@@ -202,41 +208,77 @@ impl WindowBackend for X11Backend {
 
     fn create_shortcut(&self, display_text: String, keycode: u8, modifiers: u16) -> Result<Shortcut, BackendError> {
         if keycode == 0 { return Err(BackendError::Unsupported("Ungültiger Keycode".into())); }
-        let clean_modifiers = modifiers & !18;
+        // KORREKTUR: Masken definieren — CapsLock/NumLock/ScrollLock (Locks) und die
+        // X11-"Blinker"-Masken (X11_MASK), die GTK beim Tastendruck mitliefert, aber
+        // nicht Teil der eigentlichen Kombination sind.
+        const LOCK_MASK: u16 = 0x8002; // ShiftLock (CapsLock) | Lock (NumLock) | Mod5 (ScrollLock)
+        const X11_MASK: u16 = 0x80 | 0x4000 | 0x8000; // X11KeyDial | AltGr | Super
+        let clean_modifiers = modifiers & !(LOCK_MASK | X11_MASK);
         Ok(Shortcut { display_text, keycode, modifiers: clean_modifiers })
     }
 
     fn grab_hotkey(&self, shortcut: &Shortcut) -> Result<(), BackendError> {
-        let extra_masks = [0, 2, 16, 18];
-        for extra in extra_masks {
-            let mask = ModMask::from((shortcut.modifiers | extra) as u16);
-            let _ = self.conn.grab_key(true, self.root, mask, shortcut.keycode, GrabMode::ASYNC, GrabMode::ASYNC);
+        // KORREKTUR: "locked" (2. Parameter) auf false — sonst wird der Hotkey bei
+        // aktivem Lock (z.B. NumLock) nicht ausgelöst. Zusätzlich werden alle
+        // denkbaren Lock-/Blinker-Kombinationen gegrabt, damit der Grab auch bei
+        // gedrückter Feststelltaste greift.
+        let conn = self.grab_connection();
+        let lock_masks = [0x0000u16, 0x0002, 0x0010, 0x0012, 0x4000, 0x4002, 0x4010, 0x4012];
+        for extra in lock_masks {
+            let mask = ModMask::from(shortcut.modifiers | extra);
+            let _ = conn.grab_key(false, self.root, mask, shortcut.keycode, GrabMode::ASYNC, GrabMode::ASYNC);
         }
-        self.conn.flush().map_err(|e| BackendError::X11(e.to_string()))?;
+        conn.flush().map_err(|e| BackendError::X11(e.to_string()))?;
         Ok(())
     }
 
     fn ungrab_hotkey(&self, shortcut: &Shortcut) -> Result<(), BackendError> {
-        let extra_masks = [0, 2, 16, 18];
-        for extra in extra_masks {
-            let mask = ModMask::from((shortcut.modifiers | extra) as u16);
-            let _ = self.conn.ungrab_key(shortcut.keycode, self.root, mask);
+        let conn = self.grab_connection();
+        let lock_masks = [0x0000u16, 0x0002, 0x0010, 0x0012, 0x4000, 0x4002, 0x4010, 0x4012];
+        for extra in lock_masks {
+            let mask = ModMask::from(shortcut.modifiers | extra);
+            let _ = conn.ungrab_key(shortcut.keycode, self.root, mask);
         }
-        self.conn.flush().map_err(|e| BackendError::X11(e.to_string()))?;
+        conn.flush().map_err(|e| BackendError::X11(e.to_string()))?;
         Ok(())
     }
 
     fn start_events(&self, tx: Sender<BackendEvent>) -> Result<(), BackendError> {
         let mut guard = self.event_thread.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() { return Ok(()); }
+
+        // KORREKTUR: Eigene X11-Verbindung nur für Events/Grabs. Grabs und
+        // KeyEvents dürfen nicht über die geteilte UI-Connection laufen, sonst
+        // konkurrieren Event-Loop und UI-Thread um dieselben Antworten (Race).
+        let (conn, screen_num) = x11rb::connect(None).map_err(|e| BackendError::Connection(e.to_string()))?;
+        let root = conn.setup().roots[screen_num].root;
+        let conn = Arc::new(conn);
+
+        // Root für KeyEvents UND Struktur-/Property-Changes abonnieren.
+        // KORREKTUR: Die Event-Maske des Root-Fensters wird vom Server ersetzt, nicht
+        // addiert — daher müssen alle Masken in EINER Änderung gesetzt werden.
+        let _ = conn.change_window_attributes(root, &ChangeWindowAttributesAux::new()
+            .event_mask(EventMask::KEY_PRESS_MASK | EventMask::KEY_RELEASE_MASK
+                | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE));
+        let _ = conn.flush();
+
+        // Grab-Operationen über dieselbe Connection wie den Event-Loop ausführen,
+        // damit Grabs nicht mit UI-Replies auf der Haupt-Connection vermischt werden.
+        *self.grab_conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&conn));
+
         self.running.store(true, Ordering::Relaxed);
-        let handle = spawn_event_loop(Arc::clone(&self.conn), self.atoms.clone(), self.root, Arc::clone(&self.running), tx)?;
+        let handle = spawn_event_loop(conn, self.atoms.clone(), root, Arc::clone(&self.running), tx)?;
         *guard = Some(handle);
         Ok(())
     }
 
     fn stop_events(&self) {
         self.running.store(false, Ordering::Relaxed);
+        // KORREKTUR: Grab-/Event-Connection explizit schließen, sonst wartet der
+        // Event-Thread in poll_for_event() ewig und handle.join() deadlockt beim Beenden.
+        if let Some(conn) = self.grab_conn.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = conn.disconnect();
+        }
         if let Some(handle) = self.event_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = handle.join();
         }
@@ -260,8 +302,14 @@ fn spawn_event_loop(conn: Arc<RustConnection>, atoms: Atoms, root: Window, runni
                         let _ = tx.send(BackendEvent::WindowClosed(e.window));
                         changed = true;
                     }
-                    Event::KeyPress(e) => {
-                        let _ = tx.send(BackendEvent::KeyPress(e.detail, (u16::from(e.state)) & 0xFF));
+                    Event::KeyRelease(e) => {
+                        // KORREKTUR: KeyRelease statt KeyPress verwenden. Bei Grab-Events
+                        // wird der Keycode des eigentlichen Hotkeys garantiert korrekt
+                        // geliefert, und die Fensteraktivierung erfolgt beim Loslassen
+                        // (Standardverhalten von Hotkey-Daemons). Lock-Bits bereinigen.
+                        const LOCK_MASK: u16 = 0x8002; // ShiftLock | Lock (NumLock) | Mod5
+                        let mods = u16::from(e.state) & !LOCK_MASK;
+                        let _ = tx.send(BackendEvent::KeyPress(e.detail, mods));
                     }
                     Event::CreateNotify(_) | Event::MapNotify(_) | Event::UnmapNotify(_) | Event::ConfigureNotify(_) | Event::ReparentNotify(_) => {
                         changed = true;
