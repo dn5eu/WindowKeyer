@@ -44,12 +44,18 @@ fn variant_str(v: Option<&Variant<Box<dyn RefArg>>>) -> String {
     v.and_then(|v| v.0.as_str().map(str::to_string)).unwrap_or_default()
 }
 fn variant_bool(v: Option<&Variant<Box<dyn RefArg>>>) -> bool {
-    // dbus 0.9: Box<dyn RefArg> hat keine downcast_ref-Methode; stattdessen
-    // den konkreten Wert aus dem Iterator-Read des inneren RefArg holen.
+    // dbus 0.9: `Get::get` erwartet einen Iter, nicht &dyn RefArg — für
+    // RefArg-Werte sind die as_i64/as_u64-Reader der richtige Weg (dokumentiert
+    // explizit für ArgType::Boolean unterstützt).
     v.and_then(|v| {
-        let bool_ref: &dyn RefArg = &**&v.0;
-        <bool as dbus::arg::Get>::get(bool_ref.get())
-    }).unwrap_or(false)
+        let inner: &(dyn RefArg + 'static) = &*v.0;
+        if inner.arg_type() == dbus::arg::ArgType::Boolean {
+            inner.as_i64().or_else(|| inner.as_u64().map(|x| x as i64)).map(|x| x != 0)
+        } else {
+            None
+        }
+    })
+    .unwrap_or(false)
 }
 
 /// Ein bei KWin registrierter globaler Shortcut (temporär, nur im RAM).
@@ -276,10 +282,10 @@ impl KdeWaylandBackend {
         // path_namespace deckt auch später hinzukommende Actions ab.
         let ns = collection.trim_end_matches('/').to_string();
         for member in ["activated", "activate"] {
-            let mut rule: MatchRule<'static> = MatchRule {
-                msg_type: Some(dbus::MessageType::Signal),
-                ..Default::default()
-            };
+            // MatchRule hat ein privates Feld — nicht mit ..Default::default()
+            // konstruieren, sondern Default nehmen und Felder einzeln setzen.
+            let mut rule = MatchRule::<'static>::default();
+            rule.msg_type = Some(dbus::MessageType::Signal);
             rule.interface = Some(dbus::strings::Interface::from("org.kde.Action"));
             rule.member = Some(dbus::strings::Member::from(member.to_string()));
             rule.path = Some(dbus::strings::Path::from(ns.clone()));
@@ -432,18 +438,16 @@ fn keycode_to_keysym(keycode: u8) -> Option<u32> {
     if std::env::var_os("DISPLAY").is_some() {
         if let Ok((conn, _)) = x11rb::connect(None) {
             if let Ok(cookie) = conn.get_keyboard_mapping(keycode, 1) {
-            if let Ok(kbd) = cookie.reply() {
-                // kbd.keysyms: Vec<u8> — Bytes der Keysym-Werte,
-                // jeweils `keysyms_per_keycode` Stück pro Keycode.
-                let per = kbd.keysyms_per_keycode.max(1) as usize;
-                if let Some(bytes) = kbd.keysyms.chunks(per).next() {
-                    // Erstes 4-Byte-Little-Endian-Bündel = Basis-Keysym
-                    if bytes.len() >= 4 {
-                        let sym = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        if sym != 0 { return Some(sym); }
+                if let Ok(kbd) = cookie.reply() {
+                    // x11rb 0.13: kbd.keysyms ist ein Vec<u32>, jeweils
+                    // `keysyms_per_keycode` Einträge pro Keycode. Der erste
+                    // Eintrag ist das Basis-Keysym.
+                    if let Some(&sym) = kbd.keysyms.first() {
+                        if sym != 0 {
+                            return Some(sym);
+                        }
                     }
                 }
-            }
             }
         }
     }
