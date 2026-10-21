@@ -1,0 +1,21 @@
+[package]
+name = "windowkeyer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI
+gtk4 = "0.9"
+glib = "0.20"
+pango = "0.20"
+libadwaita = { version = "0.7", features = ["v1_4"] }
+
+# X11-Backend
+x11rb = "0.13"
+
+# Kommunikation
+crossbeam-channel = "0.5"
+thiserror = "2"
+
+# Tray Icon (Nativ für KDE via D-Bus, kein GTK 3 Konflikt!)
+ksni = "0.2"
