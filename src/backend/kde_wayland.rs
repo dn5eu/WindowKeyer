@@ -76,20 +76,70 @@ pub struct KdeWaylandBackend {
 }
 
 impl KdeWaylandBackend {
-    /// Prüft, ob ein erreichbares KWin unter Wayland läuft
-    /// (D-Bus-Antwort auf `/KWin` → Property `compositor`).
+    /// Prüft, ob ein erreichbares KWin unter Wayland läuft.
     pub fn is_available() -> bool {
         let Ok(conn) = Connection::new_session() else { return false };
-        Self::compositor_kind(&conn).as_deref() == Some("wayland-general")
+        Self::compositor_kind(&conn).as_deref() == Some("wayland")
     }
 
+    /// Liefert "wayland" / "x11" / None.
+    ///
+    /// KWin exportiert die Property `compositor` je nach Version/Setup unter
+    /// unterschiedlichen Interfaces am Objekt `/KWin`:
+    /// * Plasma 5/6 Standard: Interface `org.kde.KWin`, Werte `"wayland"`/`"x11"`
+    /// * manche Setups/Ältere: nur über ein anderes Interface sichtbar
+    ///   (dann liefert der direkte `Get` einen Fehler wie
+    ///   „Property org.kde.KWin.compositor was not found in object /KWin").
+    ///
+    /// Deshalb: erst direkter Get, danach Introspektion von `/KWin` und
+    /// Get-Versuche auf allen gefundenen Interfaces; als letzten Anker die
+    /// Environment-Variable XDG_SESSION_TYPE.
     fn compositor_kind<C: dbus::blocking::BlockingSender>(conn: &C) -> Option<String> {
         let p = Proxy::new(KWIN_DEST, "/KWin", TIMEOUT, conn);
+
+        // 1) Direkter Get auf dem Standard-Interface
+        if let Some(k) = Self::read_compositor_prop(&p, "org.kde.KWin") { return Some(k); }
+
+        // 2) Introspection: alle Interfaces von /KWin abfragen und dort je den
+        //    Get auf "compositor" versuchen.
+        let introspected: Vec<String> = {
+            let r: Result<(String,), _> = p.method_call(
+                "org.freedesktop.DBus.Introspectable", "Introspect", ());
+            match r {
+                Ok((xml,)) => parse_introspection_interfaces(&xml),
+                Err(e) => { debugln!("[KWinDBus] Introspection fehlgeschlagen: {e}"); Vec::new() }
+            }
+        };
+        for iface in introspected {
+            if iface == "org.kde.KWin" { continue; } // schon versucht
+            if let Some(k) = Self::read_compositor_prop(&p, &iface) { return Some(k); }
+        }
+
+        // 3) Letzter Anker: Wenn XDG_SESSION_TYPE=wayland und wir hierher
+        //    kommen, ist KWin zwar erreichbar, aber die Property nirgends
+        //    lesbar → trotzdem als Wayland einstufen (sonst würde der Nutzer
+        //    nie das native Backend bekommen).
+        if std::env::var("XDG_SESSION_TYPE").map(|v| v.eq_ignore_ascii_case("wayland")).unwrap_or(false) {
+            debugln!("[KWinDBus] compositor-Property nirgends gefunden, nutze XDG_SESSION_TYPE=wayland");
+            return Some("wayland".into());
+        }
+
+        debugln!("[KWinDBus] compositor-Property nirgends gefunden");
+        None
+    }
+
+    fn read_compositor_prop<T: dbus::blocking::BlockingSender, C: std::ops::Deref<Target = T>>(
+        p: &Proxy<'_, C>, iface: &str) -> Option<String> {
         let r: Result<(Variant<Box<dyn RefArg>>,), _> = p.method_call(
-            "org.freedesktop.DBus.Properties", "Get", ("org.kde.KWin", "compositor"));
+            "org.freedesktop.DBus.Properties", "Get", (iface, "compositor"));
         match r {
-            Ok((v,)) => v.0.as_str().map(str::to_string),
-            Err(e) => { debugln!("[KWinDBus] compositor-Abfrage fehlgeschlagen: {e}"); None }
+            Ok((v,)) => v.0.as_str().map(|s| {
+                let s = s.to_lowercase();
+                // Normalisieren: "wayland"/"wayland-general" → wayland,
+                // "x11"/"x11-general"/"X11" → x11.
+                if s.contains("wayland") { "wayland".to_string() } else { s }
+            }),
+            Err(_) => None,
         }
     }
 
@@ -98,7 +148,7 @@ impl KdeWaylandBackend {
             .map_err(|e| BackendError::Connection(e.to_string()))?;
         let kind = Self::compositor_kind(&probe)
             .ok_or_else(|| BackendError::Connection("Kein D-Bus-Zugriff auf org.kde.KWin".into()))?;
-        if kind != "wayland-general" {
+        if kind != "wayland" {
             return Err(BackendError::Unsupported(format!(
                 "KWin meldet Compositor-Typ '{kind}' — natives Wayland-Backend nur unter Plasma Wayland"
             )));
@@ -160,10 +210,40 @@ impl KdeWaylandBackend {
     }
 
     fn client_props(&self, path: &str) -> Option<HashMap<String, Variant<Box<dyn RefArg>>>> {
+        // Liefert die Client-Metadaten eines Fensters. KWin exportiert die
+        // Fenster-Properties je nach Version unter unterschiedlichen Interfaces;
+        // wir probieren daher systematisch:
+        // 1. Bekannte Interface-Namen direkt per GetAll (schnellster Pfad).
+        // 2. Fallback: Introspektion des Fensterpfads + GetAll auf jedem
+        //    gefundenen org.kde.KWin*-Interface, bis "caption"/"active" vorkommt.
         let p = Proxy::new(KWIN_DEST, path, TIMEOUT, &*self.conn);
-        let r: Result<(HashMap<String, Variant<Box<dyn RefArg>>>,), _> = p.method_call(
-            "org.freedesktop.DBus.Properties", "GetAll", ("org.kde.KWin.Windows",));
-        match r { Ok(m) => Some(m.0), Err(_) => None }
+        for iface in ["org.kde.KWin.Windows", "org.kde.KWin", "org.kde.KWin.Tablex11Client", "org.kde.KWin.TabBoxClient"] {
+            let r: Result<(HashMap<String, Variant<Box<dyn RefArg>>>,), _> = p.method_call(
+                "org.freedesktop.DBus.Properties", "GetAll", (iface,));
+            if let Ok(m) = r {
+                let map = m.0;
+                if map.contains_key("caption") || map.contains_key("active") || map.contains_key("minimized") {
+                    return Some(map);
+                }
+            }
+        }
+        // 3. Letzter Versuch: Alle Interfaces von /Windows/<n> durchsuchen.
+        let xml: String = {
+            use dbus::blocking::stdintf::org_freedesktop_dbus::Introspectable as _;
+            match p.introspect() { Ok(x) => x, Err(_) => return None }
+        };
+        for iface in parse_introspection_interfaces(&xml) {
+            if !iface.starts_with("org.kde.KWin") { continue; }
+            let r: Result<(HashMap<String, Variant<Box<dyn RefArg>>>,), _> = p.method_call(
+                "org.freedesktop.DBus.Properties", "GetAll", (&iface,));
+            if let Ok(m) = r {
+                let map = m.0;
+                if map.contains_key("caption") || map.contains_key("active") || map.contains_key("minimized") {
+                    return Some(map);
+                }
+            }
+        }
+        None
     }
 
     fn info_for(&self, path: &str) -> Option<WindowInfo> {
@@ -184,7 +264,6 @@ impl KdeWaylandBackend {
     }
 
     /// Übersetzt GTK-Keycode + Modifier-Maske in eine KWin-KeySequence wie
-    /// "Meta+Ctrl+f". Modifier-Maske = X11-Bits, so wie die UI sie aus dem
     /// GTK-State des Key-Events übernimmt (`state.bits()`):
     /// Shift 0x1, CapsLock 0x2, Control 0x4, Mod1/Alt 0x8, NumLock 0x10,
     /// Mod3 0x20, Super/Mod4 0x40, Mod5 0x80. Locks werden vorab von
@@ -342,6 +421,30 @@ fn poll_window_paths<C: dbus::blocking::BlockingSender>(conn: &C) -> Vec<String>
     }
 }
 
+/// Hilfsfunktion: Extrahiere alle Interface-Namen aus einem Introspektions-XML.
+/// Erwartetes Format: `<interface name="...">`.
+fn parse_introspection_interfaces(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = xml.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Suche nach interface name="
+        if xml[i..].starts_with("<interface name=\"") {
+            let start = i + "<interface name=\"".len();
+            if let Some(end) = xml[start..].find('"') {
+                let iface = &xml[start..start+end];
+                if !iface.is_empty() && !out.iter().any(|s| s == iface) {
+                    out.push(iface.to_string());
+                }
+                i = start + end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 impl WindowBackend for KdeWaylandBackend {
     fn name(&self) -> &str { "KDE Plasma Wayland (KWin D-Bus)" }
     fn window_manager_name(&self) -> &str { &self.wm_name }
@@ -373,6 +476,14 @@ impl WindowBackend for KdeWaylandBackend {
 
     fn create_shortcut(&self, display_text: String, keycode: u8, modifiers: u16) -> Result<Shortcut, BackendError> {
         if keycode == 0 { return Err(BackendError::Unsupported("Ungültiger Keycode".into())); }
+        // KDE-Wayland arbeitet mit evdev-Hardware-Keycodes (GTK4 unter Wayland
+        // liefert genau die in EventControllerKey). evdev-Kernel-Codes sind
+        // klein (< 256), aber nicht identisch mit den X11-/XKB-Layout-codes,
+        // die das X11-Backend grabbt. Wir übersetzen deshalb mit libei/ei
+        // nicht — stattdessen nutzen wir xkbcommon via gdk_keymap (s.u.) bzw.
+        // eine eigene Lookup-Tabelle. Damit die UI und der Grab-Mechanismus
+        // trotzdem funktionieren, übernehmen wir die raw codes unverändert und
+        // mappen sie später beim Registrieren auf Keysyms.
         const LOCK_MASK: u16 = 0x8002;                 // CapsLock | NumLock | ScrollLock
         const X11_MASK: u16 = 0x80 | 0x4000 | 0x8000;  // Dial | AltGr | extra Super-Bit
         Ok(Shortcut { display_text, keycode, modifiers: modifiers & !(LOCK_MASK | X11_MASK) })
