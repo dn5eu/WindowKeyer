@@ -22,6 +22,10 @@ thiserror = "2"
 # Tray Icon (Nativ für KDE via D-Bus, kein GTK 3 Konflikt!)
 ksni = "0.2"
 
+# Phase 3a: KDE Wayland Backend über D-Bus (KWin/GlobalShortcuts)
+# dbus 0.9 ist bereits als Transitiv-Dependency von ksni vorhanden.
+dbus = "0.9"
+
 [features]
 default = []
 adwaita = ["dep:libadwaita"]
