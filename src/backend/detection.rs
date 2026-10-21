@@ -59,11 +59,11 @@ impl SessionInfo {
         )
     }
 
-    /// Ehrliche Warnung für Phase 1.
+    /// Ehrliche Warnung je nach Session.
     pub fn warning(&self) -> Option<&'static str> {
         match self.kind {
 			SessionKind::Wayland => Some(
-				"Wayland: Phase 1 sieht nur XWayland-Fenster. Native Wayland-Fenster folgen in Phase 3.",
+				"Wayland: natives Backend verfügbar unter KDE Plasma (KWin D-Bus), sonst nur XWayland-Fenster sichtbar.",
 			),
 			_ => None,
 		}

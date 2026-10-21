@@ -33,6 +33,13 @@ impl HotkeyManager {
 			}
 		}
 
+		// KORREKTUR: Vorher wurde der Shortcut bereits in `bindings` insertiert,
+		// bevor der Grab stattfand. schlug der Grab fehl (z.B. Backend-Fehler),
+		// blieb ein Geist-Eintrag in der Hinwärtskarte zurück, der nie mehr
+		// entfernt wurde und Fenster-Zuordnungen verfälschte. Jetzt erst graben,
+		// dann committen — bei Fehlern bleiben beide Karten unverändert.
+		backend.grab_hotkey_for_window(&shortcut, window_id)?;
+
 		if let Some(old_window_id) = self.bindings.insert(shortcut.clone(), window_id) {
 			if old_window_id != window_id {
 				self.remove_from_reverse_map(old_window_id, &shortcut);
@@ -40,8 +47,6 @@ impl HotkeyManager {
 				overwritten_shortcut = Some(shortcut.clone());
 			}
 		}
-
-		backend.grab_hotkey_for_window(&shortcut, window_id)?;
 
 		self.window_bindings
 		.entry(window_id)

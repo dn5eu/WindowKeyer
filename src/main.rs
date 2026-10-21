@@ -35,16 +35,26 @@ fn main() {
         match backend_name {
             "kde_wayland" => {
                 debugln!("[windowkeyer] Versuche KDE Plasma Wayland Backend...");
-                match KdeWaylandBackend::new() {
-                    Ok(b) => Ok(Arc::new(b) as Arc<dyn WindowBackend>),
-                    Err(e) => {
-                        // Graceful Fallback: natives Backend nicht verfügbar
-                        // (z.B. Plasma < mit GlobalShortcutManager oder kein
-                        // D-Bus) → XWayland/X11-Backend verwenden.
-                        debugln!("[windowkeyer] KDE-Wayland-Backend nicht verfügbar ({e}); fallback auf X11/XWayland");
-                        X11Backend::new()
-                            .map(|b| Arc::new(b) as Arc<dyn WindowBackend>)
-                            .map_err(|e2| format!("{e} — X11-Fallback ebenfalls fehlgeschlagen: {e2}"))
+                // Vorab-Check: ohne erreichbares KWin-Wayland gar nicht erst
+                // eine Hotkey-Collection in KWin anlegen, sondern direkt
+                // sauber auf X11/XWayland zurückfallen.
+                if !KdeWaylandBackend::is_available() {
+                    debugln!("[windowkeyer] Kein erreichbares KWin (Wayland) — Fallback auf X11/XWayland");
+                    X11Backend::new()
+                        .map(|b| Arc::new(b) as Arc<dyn WindowBackend>)
+                        .map_err(|e| format!("KDE-Wayland-Backend nicht verfügbar; X11-Fallback fehlgeschlagen: {e}"))
+                } else {
+                    match KdeWaylandBackend::new() {
+                        Ok(b) => Ok(Arc::new(b) as Arc<dyn WindowBackend>),
+                        Err(e) => {
+                            // Graceful Fallback: natives Backend nicht verfügbar
+                            // (z.B. Plasma < mit GlobalShortcutManager oder kein
+                            // D-Bus) → XWayland/X11-Backend verwenden.
+                            debugln!("[windowkeyer] KDE-Wayland-Backend nicht verfügbar ({e}); fallback auf X11/XWayland");
+                            X11Backend::new()
+                                .map(|b| Arc::new(b) as Arc<dyn WindowBackend>)
+                                .map_err(|e2| format!("{e} — X11-Fallback ebenfalls fehlgeschlagen: {e2}"))
+                        }
                     }
                 }
             }
