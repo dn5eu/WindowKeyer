@@ -1,0 +1,111 @@
+From 587283477add4ab2a2a61ad1f64ac039ffd49d70 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Wed, 21 Oct 2026 19:23:11 +0000
+Subject: [PATCH] X11-Backend: eigenes Fenster aus der Window-Keyer-Liste
+ ausblenden
+
+- X11Backend erhaelt own_window_ids-Cache (Mutex<Vec<Window>>)
+- refresh_own_window_ids(): ermittelt eigene FensterIDs ueber _NET_WM_PID
+  im Abgleich mit std::process::id(); wird bei jedem list_windows()-Aufruf
+  erneut versucht, solange der Cache leer ist (GTK-Fenster existiert erst
+  nach App-Aktivierung)
+- list_windows() filtert alle gecachten eigenen Fenster-IDs heraus
+- Atom _NET_WM_PID in Atoms::new() interniert
+- debugln! gibt erkannte eigene Fenster-IDs aus (--debug)
+
+Filterung erfolgt backend-seitig, damit UI und kuenftige Backends das
+Verhalten automatisch erben.
+---
+ src/backend/x11.rs | 34 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/x11.rs b/src/backend/x11.rs
+index b96e3bc..ebaa9e3 100644
+--- a/src/backend/x11.rs
++++ b/src/backend/x11.rs
+@@ -33,6 +33,7 @@ struct Atoms {
+     wm_change_state: Atom,
+     utf8_string: Atom,
+     wm_state: Atom,
++    net_wm_pid: Atom,
+ }
+ 
+ fn intern(conn: &RustConnection, name: &str) -> Result<Atom, BackendError> {
+@@ -59,6 +60,7 @@ impl Atoms {
+            wm_change_state: intern(conn, "WM_CHANGE_STATE")?,
+            utf8_string: intern(conn, "UTF8_STRING")?,
+            wm_state: intern(conn, "WM_STATE")?,
++           net_wm_pid: intern(conn, "_NET_WM_PID")?,
+         })
+     }
+ }
+@@ -102,6 +104,11 @@ fn is_hidden(conn: &RustConnection, win: Window, atoms: &Atoms) -> bool {
+ 
+ fn server_time(_conn: &RustConnection) -> u32 { x11rb::CURRENT_TIME }
+ 
++/// Liest `_NET_WM_PID` eines Fensters (0 wenn nicht gesetzt).
++fn window_pid(conn: &RustConnection, win: Window, net_wm_pid: Atom) -> u32 {
++    prop_values(conn, win, net_wm_pid).unwrap_or_default().first().copied().unwrap_or(0)
++}
++
+ pub struct X11Backend {
+     conn: Arc<RustConnection>,
+     grab_conn: Arc<Mutex<Option<Arc<RustConnection>>>>,
+@@ -110,6 +117,9 @@ pub struct X11Backend {
+     wm_name: String,
+     running: Arc<AtomicBool>,
+     event_thread: Mutex<Option<JoinHandle<()>>>,
++    /// X11-Fenster-IDs unseres eigenen Prozesses — werden aus der Liste
++    /// ausgefiltert, damit sich der Window Keyer nicht selbst anzeigt.
++    own_window_ids: Mutex<Vec<Window>>,
+ }
+ 
+ impl X11Backend {
+@@ -129,7 +139,25 @@ impl X11Backend {
+         let _ = conn.flush();
+ 
+         debugln!("[X11] verbunden: root={root:#010x}, wm={wm_name}");
+-        Ok(Self { conn, grab_conn: Arc::new(Mutex::new(None)), atoms, root, wm_name, running: Arc::new(AtomicBool::new(false)), event_thread: Mutex::new(None) })
++        Ok(Self { conn, grab_conn: Arc::new(Mutex::new(None)), atoms, root, wm_name, running: Arc::new(AtomicBool::new(false)), event_thread: Mutex::new(None), own_window_ids: Mutex::new(Vec::new()) })
++    }
++
++    /// Identifiziert die X11-Fenster-IDs unseres eigenen Prozesses über
++    /// `_NET_WM_PID` und cached sie. Wird bei jedem `list_windows()`-Aufruf
++    /// erneut versucht, solange die Liste leer ist (das GTK-Fenster existiert
++    /// erst, nachdem die App aktiv ist).
++    fn refresh_own_window_ids(&self) {
++        let mut guard = self.own_window_ids.lock().unwrap_or_else(|e| e.into_inner());
++        if !guard.is_empty() { return; }
++        let my_pid = std::process::id() as u32;
++        let mut ids = prop_values(&self.conn, self.root, self.atoms.client_list_stacking).unwrap_or_default();
++        if ids.is_empty() { ids = prop_values(&self.conn, self.root, self.atoms.client_list).unwrap_or_default(); }
++        for id in ids {
++            if window_pid(&self.conn, id, self.atoms.net_wm_pid) == my_pid {
++                debugln!("[X11] eigenes Fenster erkannt: {id:#010x} (PID {my_pid}) — wird ausgeblendet");
++                guard.push(id);
++            }
++        }
+     }
+ 
+     fn grab_connection(&self) -> Arc<RustConnection> {
+@@ -157,6 +185,8 @@ impl WindowBackend for X11Backend {
+     fn window_manager_name(&self) -> &str { &self.wm_name }
+ 
+     fn list_windows(&self) -> Result<Vec<WindowInfo>, BackendError> {
++        self.refresh_own_window_ids();
++        let own = self.own_window_ids.lock().unwrap_or_else(|e| e.into_inner()).clone();
+         let mut ids = prop_values(&self.conn, self.root, self.atoms.client_list_stacking).unwrap_or_default();
+         if ids.is_empty() { ids = prop_values(&self.conn, self.root, self.atoms.client_list).unwrap_or_default(); }
+         ids.reverse();
+@@ -164,6 +194,8 @@ impl WindowBackend for X11Backend {
+         let mut result = Vec::new();
+ 
+         for id in ids {
++            // eigenes Fenster (Window Keyer) nicht anzeigen
++            if own.contains(&id) { continue; }
+             let Ok(cookie) = self.conn.get_window_attributes(id) else { continue; };
+             if cookie.reply().is_err() { continue; }
+             if self.should_skip(id) { continue; }
+-- 
+2.39.5
+
