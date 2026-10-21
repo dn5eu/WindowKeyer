@@ -35,11 +35,13 @@ struct UiState {
     backend_events: Mutex<Receiver<BackendEvent>>,
     commands: Mutex<Receiver<UiCommand>>,
     commands_tx: Sender<UiCommand>,
+    app: Application,
     hotkey_manager: Arc<Mutex<HotkeyManager>>,
     identity: RefCell<Vec<(u32, String, String, bool)>>,
     rows: RefCell<Vec<RowViews>>,
     ids: Rc<RefCell<Vec<u32>>>,
     ticks: Cell<u32>,
+    poll_source_id: Cell<Option<glib::SourceId>>,
 }
 
 fn subtitle_text(info: &WindowInfo) -> String {
@@ -176,14 +178,27 @@ fn capture_hotkey(parent: &impl gtk4::prelude::IsA<gtk4::Window>, window_title: 
     let main_loop_for_key = main_loop.clone();
     let main_loop_for_close = main_loop.clone();
 
-    let controller = gtk4::EventControllerKey::new();
-    controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
-        if keyval == Key::Escape && state == ModifierType::empty() {
-            window_clone.hide();
-            main_loop_for_key.quit();
+    // KORREKTUR: Auf key_released lauschen statt key_pressed. GTK liefert beim
+    // Drücken von Shift+taste einen anderen Keycode als beim X11-Grab (der an der
+    //physischen Taste hängt). Beim Loslassen meldet GTK denselben Basis-Keycode wie
+    // das KeyRelease-Event des Grabs — dadurch funktionieren auch Shift-Kombinationen.
+    // Abbruch schon beim Drücken von Esc (nicht erst beim Loslassen)
+    let esc_controller = gtk4::EventControllerKey::new();
+    let window_for_esc = window.clone();
+    let loop_for_esc = main_loop.clone();
+    esc_controller.connect_key_pressed(move |_controller, keyval, _keycode, _state| {
+        if keyval == Key::Escape {
+            window_for_esc.hide();
+            loop_for_esc.quit();
             return glib::Propagation::Stop;
         }
-        if is_modifier_only(keyval) {
+        glib::Propagation::Proceed
+    });
+    window.add_controller(esc_controller);
+
+    let controller = gtk4::EventControllerKey::new();
+    controller.connect_key_released(move |_controller, keyval, keycode, state| {
+        if keyval == Key::Escape || is_modifier_only(keyval) {
             return glib::Propagation::Proceed;
         }
 
@@ -191,7 +206,7 @@ fn capture_hotkey(parent: &impl gtk4::prelude::IsA<gtk4::Window>, window_title: 
         status.set_text(&format!("Erkannt: {}", display_text));
 
         if keycode > 0 && keycode <= 255 {
-            if let Ok(shortcut) = backend_clone.create_shortcut(display_text, keycode as u8, (state.bits() & 0xFFFF) as u16) {
+            if let Ok(shortcut) = backend_clone.create_shortcut(display_text, keycode as u8, state.bits() as u16) {
                 *result_clone.borrow_mut() = Some(shortcut);
                 window_clone.hide();
                 main_loop_for_key.quit();
@@ -279,7 +294,7 @@ impl UiState {
     fn poll(&self) {
         let mut refresh = false; let mut status_message: Option<String> = None;
 
-        if let Ok(rx) = self.backend_events.lock() {
+        { let rx = self.backend_events.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(event) = rx.try_recv() {
                 match event {
                     BackendEvent::WindowsChanged => refresh = true,
@@ -298,17 +313,19 @@ impl UiState {
             }
         }
 
-        if let Ok(rx) = self.commands.lock() {
+        { let rx = self.commands.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(command) = rx.try_recv() {
                 match command {
                     UiCommand::Refresh => refresh = true,
                     UiCommand::Status(msg) => status_message = Some(msg),
                     UiCommand::ShowWindow => {
-                        // Wird vom Hauptfenster behandelt
+                        // Wird im Main-Loop-Handler von main.rs behandelt
                     }
                     UiCommand::Quit => {
-                        // Wird vom Hauptfenster behandelt
-                        std::process::exit(0);
+                        // KORREKTUR: Kein process::exit(0) mehr — das übersprang Drop
+                        // (X11-Grabs blieben aktiv!) und konnte mitten im Lock passieren.
+                        // Stattdessen sauberes Herunterfahren über die Application.
+                        self.app.quit();
                     }
                 }
             }
@@ -342,9 +359,10 @@ pub fn build_ui(app: &Application, backend: Arc<dyn WindowBackend>, session: Ses
     let ids: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
 
     let state = Rc::new(UiState {
-        backend: Arc::clone(&backend), list_box: list_box.clone(), status_label, session,
+        backend: Arc::clone(&backend), list_box: list_box.clone(), status_label, session, app: app.clone(),
                         backend_events: Mutex::new(backend_rx), commands: Mutex::new(commands_rx), commands_tx: commands_tx.clone(),
                         hotkey_manager, identity: RefCell::new(Vec::new()), rows: RefCell::new(Vec::new()), ids: Rc::clone(&ids), ticks: Cell::new(0),
+                        poll_source_id: Cell::new(None),
     });
 
     {
@@ -360,7 +378,18 @@ pub fn build_ui(app: &Application, backend: Arc<dyn WindowBackend>, session: Ses
     state.refresh();
     if let Err(e) = backend.start_events(backend_tx) { state.set_status(&format!("Event-Loop nicht gestartet: {e}.")); }
 
-    { let state = Rc::clone(&state); glib::timeout_add_local(Duration::from_millis(300), move || { state.poll(); glib::ControlFlow::Continue }); }
+    // KORREKTUR: Der Polling-Timer wird an das Fenster gehängt und beim Destroy
+    // automatisch entfernt. Vorher lief bei jeder Re-Aktivierung (z.B. Tray-Klick
+    // nach Fenster-Schließen) ein alter Timer weiter, der ins Leere pollte.
+    let state_for_destroy = Rc::clone(&state);
+    window.connect_destroy(move |_| {
+        if let Some(id) = state_for_destroy.poll_source_id.take() {
+            id.destroy();
+        }
+    });
+    { let state = Rc::clone(&state);
+      let id = glib::timeout_add_local(Duration::from_millis(300), move || { state.poll(); glib::ControlFlow::Continue });
+      state.poll_source_id.set(Some(id)); }
     { let commands_tx = commands_tx.clone(); refresh_button.connect_clicked(move |_| { let _ = commands_tx.send(UiCommand::Refresh); }); }
 
     let window_for_close = window.clone();
