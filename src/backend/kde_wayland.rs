@@ -184,14 +184,21 @@ impl KdeWaylandBackend {
     }
 
     /// Übersetzt GTK-Keycode + Modifier-Maske in eine KWin-KeySequence wie
-    /// "Meta+Ctrl+f". Modifier-Maske = X11-Bits (Shift 0x1, Ctrl 0x4,
-    /// Alt 0x8, Super/Mod4 0x40), so wie `create_shortcut` sie liefert.
+    /// "Meta+Ctrl+f". Modifier-Maske = X11-Bits, so wie die UI sie aus dem
+    /// GTK-State des Key-Events übernimmt (`state.bits()`):
+    /// Shift 0x1, CapsLock 0x2, Control 0x4, Mod1/Alt 0x8, NumLock 0x10,
+    /// Mod3 0x20, Super/Mod4 0x40, Mod5 0x80. Locks werden vorab von
+    /// `create_shortcut` herausgerechnet; falls doch eines durchrutscht,
+    /// ignorieren wir es hier ebenfalls (KWin würde die Sequenz sonst als
+    /// unauflösbar ablehnen).
     fn key_sequence(s: &Shortcut) -> String {
+        const LOCK_MASK: u16 = 0x2 | 0x10 | 0x80; // CapsLock | NumLock | ScrollLock(Mod5)
+        let m = s.modifiers & !LOCK_MASK;
         let mut parts: Vec<String> = Vec::new();
-        if s.modifiers & 0x0001 != 0 { parts.push("Shift".into()); }
-        if s.modifiers & 0x0004 != 0 { parts.push("Ctrl".into()); }
-        if s.modifiers & 0x0008 != 0 { parts.push("Alt".into()); }
-        if s.modifiers & 0x0040 != 0 { parts.push("Meta".into()); }
+        if m & 0x0001 != 0 { parts.push("Shift".into()); }
+        if m & 0x0004 != 0 { parts.push("Ctrl".into()); }
+        if m & 0x0008 != 0 { parts.push("Alt".into()); }
+        if m & 0x0040 != 0 { parts.push("Meta".into()); }
 
         match keycode_to_keysym(s.keycode).and_then(keysym_name) {
             Some(k) => { parts.push(k); parts.join("+") }

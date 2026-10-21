@@ -20,6 +20,11 @@ use tray::WindowkeyerTray;
 use ui::UiCommand;
 
 fn main() {
+    // KORREKTUR: "--debug" ist eine programmeigene Option. Die Debug-Auswertung
+    // unten liest sie direkt aus env::args(); GtkApplication würde sie bei
+    // aktivem CommandLine-Handling als "Unbekannte Option --debug" ablehnen —
+    // deshalb starten wir ohne HANDLES_OPEN/HANDLES_COMMAND_LINE und
+    // übergeben nur argv[0] an GTK (keine glib/GTK-Optionen durchgereicht).
     let debug_enabled = std::env::args().any(|arg| arg == "--debug");
     debug::DEBUG.store(debug_enabled, std::sync::atomic::Ordering::Relaxed);
 
@@ -27,6 +32,14 @@ fn main() {
     debugln!("[windowkeyer] {}", session.summary());
     if let Some(warning) = session.warning() {
         debugln!("[windowkeyer] WARNUNG: {warning}");
+    }
+
+    // Unter Wayland ohne DISPLAY muss GTK/X11 gezwungen werden, damit
+    // XWayland startet — sonst schlägt jede Backend-Auswahl fehl, bevor
+    // der Fallback ausgeführt werden kann.
+    if session.display.is_none() && std::env::var_os("DISPLAY").is_none() {
+        unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+        debugln!("[windowkeyer] Kein DISPLAY gesetzt — erzwinge GDK_BACKEND=x11 (XWayland)");
     }
 
     let backend_result: Result<Arc<dyn WindowBackend>, String> = {
@@ -67,6 +80,9 @@ fn main() {
 
     let app = gtk4::Application::builder()
     .application_id("de.windowkeyer.Windowkeyer")
+    // Nur Flags, die Windowkeyer wirklich braucht: keine Open-/CommandLine-
+    // Behandlung → GTK parst argv nicht und lehnt "--debug" nicht ab.
+    .flags(gtk4::gio::ApplicationFlags::empty())
     .build();
 
     match backend_result {

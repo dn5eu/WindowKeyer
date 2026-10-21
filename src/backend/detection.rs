@@ -63,7 +63,7 @@ impl SessionInfo {
     pub fn warning(&self) -> Option<&'static str> {
         match self.kind {
 			SessionKind::Wayland => Some(
-				"Wayland: natives Backend verfügbar unter KDE Plasma (KWin D-Bus), sonst nur XWayland-Fenster sichtbar.",
+				"Wayland: natives Backend nur unter KDE Plasma verfügbar (KWin D-Bus, GlobalShortcuts); andernfalls läuft Windowkeyer über XWayland und sieht nur X11-/XWayland-Fenster.",
 			),
 			_ => None,
 		}
