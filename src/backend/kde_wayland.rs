@@ -264,17 +264,6 @@ impl KdeWaylandBackend {
     }
 
     /// Übersetzt GTK-Keycode + Modifier-Maske in eine KWin-KeySequence wie
-    /// "Meta+Ctrl+f".
-    ///
-    /// WICHTIG: Unter **Wayland** liefert GTK4 in `EventControllerKey` den
-    /// **evdev-Hardware-Keycode** (z. B. 16 für 'q'), NICHT den X11-/XKB-Layout-
-    /// keycode (unter X11 wäre das z. B. 24). Der evdev-Wert ist layout-unabhängig
-    /// und muss daher erst über die aktive Tastatur in ein Keysym übersetzt
-    /// werden. Das done wir mit der aktiven GdkKeymap (die unter Wayland das
-    /// xkbcommon-Layout nutzt): `keycode_to_keysym` fragt dort zuerst nach,
-    /// danach wird optional eine statische evdev-US-Fallback-Tabelle befragt.
-    ///
-    /// Modifier-Maske = X11-Bits, so wie die UI sie aus dem
     /// GTK-State des Key-Events übernimmt (`state.bits()`):
     /// Shift 0x1, CapsLock 0x2, Control 0x4, Mod1/Alt 0x8, NumLock 0x10,
     /// Mod3 0x20, Super/Mod4 0x40, Mod5 0x80. Locks werden vorab von
