@@ -71,11 +71,11 @@ pub fn load_custom_icon_pixmap() -> Option<(i32, i32, Vec<u8>)> {
     // bekommen wir einen Fehler und fallen im Tray auf den Themennamen zurück.
     let pixbuf = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 64, 64, true).ok()?;
 
-    // Sicherstellen, dass der Puffer 8-bit RGBA/RGB ist; falls nicht
-    // (z. B. 16-bit PNG) über eine neue Pixbuf-Kopie normalisieren.
-    let pixbuf = if pixbuf.n_channels() == 4 && pixbuf.bits_per_sample() == 8 {
-        pixbuf
-    } else if pixbuf.n_channels() == 3 && pixbuf.bits_per_sample() == 8 {
+    // Sicherstellen, dass der Puffer 8-bit pro Kanal ist (RGB oder RGBA —
+    // 3-Kanal-Pixbufs werden unten beim Konvertieren mit Alpha 255 gefüllt).
+    // Bei anderer Bittiefe (z. B. 16-bit PNG) über eine neue Pixbuf-Kopie
+    // normalisieren.
+    let pixbuf = if pixbuf.bits_per_sample() == 8 && matches!(pixbuf.n_channels(), 3 | 4) {
         pixbuf
     } else {
         // RGB/RGBA mit anderer Bittiefe: erst zu 8-bit skalieren/konvertieren.

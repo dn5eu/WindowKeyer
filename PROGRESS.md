@@ -40,15 +40,16 @@
 - Hotkey-Aufzeichnung auf `connect_key_released` umgestellt (korrekte Keycodes/Modifier bei Shift-Kombinationen)
 - Sauberes Beenden: kein `std::process::exit(0)` mehr, stattdessen `app.quit()`; Tray-Initialisierung per `tray_ready`-Guard vor doppelter Registrierung geschützt (App re-activation nach Close-to-Tray)
 
-### ⏳ Offene Phase
+**Phase 3a – KDE Plasma Wayland Backend (neu)**
+- Natives Backend via KWin-D-Bus (`src/backend/kde_wayland.rs`): Fensterliste/Aktivieren/Minimieren über `org.kde.KWin`, globale Hotkeys über KWin GlobalShortcuts (`org.kde.GlobalShortcutManager`, temporäre Collection, Drop räumt auf)
+- Hotkey-Auslösung: `activated()`-Signal → `BackendEvent::ShortcutTriggered(name)` → `resolve_shortcut_trigger` → Fenster aktivieren
+- WindowClosed-Erkennung per Polling (~2 s); `main.rs` prüft vorab `is_available()` und fällt sauber auf X11/XWayland zurück
 
-**Phase 3 – Native Wayland-Unterstützung**
-- Platzhalter-Backend existiert bereits (`src/backend/kde_wayland.rs`)
-- Aktuell Fallback auf XWayland (funktioniert, sieht aber nur X11-Fenster)
-- Für native Wayland-Unterstützung benötigt:
-  - KDE Plasma: `org_kde_plasma_window_management`-Protokoll
-  - GNOME: Shell Extension + D-Bus
-  - wlroots (Sway/Hyprland): `wlr-foreign-toplevel-management`
+### ⏳ Offene Phasen
+
+**Phase 3b/3c – GNOME & wlroots**
+- GNOME: Shell Extension + D-Bus
+- wlroots (Sway/Hyprland): `wlr-foreign-toplevel-management`
 
 ## Architektur
 
@@ -64,7 +65,7 @@ src/
     ├── mod.rs                 # WindowBackend-Trait, BackendError, BackendEvent
     ├── detection.rs           # Session/ Desktop-Erkennung
     ├── x11.rs                 # X11/EWMH-Backend (vollständig)
-    └── kde_wayland.rs         # Platzhalter für Phase 3
+    └── kde_wayland.rs         # KDE-Wayland-Backend (KWin D-Bus, Phase 3a)
 ```
 
 ## Wichtige technische Details
@@ -114,28 +115,22 @@ Das Projekt wird in einer `nix-shell` entwickelt. Die `shell.nix` enthält alle 
 
 ## Bekannte Limitierungen
 
-1. **Wayland:** Sieht nur XWayland-Fenster. Native Wayland-Fenster fehlen (Phase 3).
+1. **Wayland:** Unter KDE Plasma nativ unterstützt (Phase 3a, KWin D-Bus). Auf anderen Wayland-Desktops (GNOME/wlroots) aktuell nur XWayland-Fenster sichtbar (Phase 3b/3c offen).
 2. **KWin Focus Stealing Prevention:** Unter bestimmten Bedingungen blockiert KWin Fokus-Requests von fremden Apps. Das Fenster kommt dann zwar nach vorne, bekommt aber nicht immer den Tastaturfokus (Taskleisten-Icon blinkt).
 3. **Debug-Ausgabe:** GTK gibt beim Start `Unbekannte Option --debug` aus (harmlos, kommt von GTKs CLI-Parser, nicht von unserem Code).
-4. **Compiler-Warnungen:** `KdeWaylandBackend` ist noch unbenutzt (erwartet, bis Phase 3 implementiert ist).
+4. **Compiler-Warnungen:** Build ist wieder warnungsfrei (toter Code aus der Platzhalter-Ära entfernt: ungenutzte Trait-Methode `uses_x11_keycodes`, redundantes Feld `RegisteredShortcut::name`).
 
 ## Nächste Schritte (Priorität)
 
-1. **Phase 3a – KDE Plasma Wayland Backend**
-   - `org_kde_plasma_window_management`-Protokoll via `wayland-scanner` + `wayland-client`
-   - KDE-Protokoll-XML-Dateien einbinden (aus `plasma-wayland-protocols`)
-   - Fenster-Listen, Aktivieren, Minimieren, Hotkey-Grabbing
-
-2. **Phase 3b – GNOME Wayland Backend** (optional)
+1. **Phase 3b – GNOME Wayland Backend** (optional)
    - Über GNOME Shell Extension + D-Bus
 
-3. **Phase 3c – wlroots Backend** (optional, für Sway/Hyprland)
+2. **Phase 3c – wlroots Backend** (optional, für Sway/Hyprland)
 
-4. **Cleanup:**
+3. **Cleanup:**
    - Echte Fehler-Ausgaben vs. Debug-Logs final trennen
-   - `KdeWaylandBackend`-Warnung unterdrücken oder Backend aktivieren
 
-5. **Packaging** (optional):
+4. **Packaging** (optional):
    - Flatpak-Manifest
    - `.desktop`-Datei für Anwendungsmenü
    - AppImage-Build

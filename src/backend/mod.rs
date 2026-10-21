@@ -1,6 +1,6 @@
 pub mod detection;
 pub mod x11;
-pub mod kde_wayland; // Platzhalter, erstellen wir gleich
+pub mod kde_wayland; // Phase 3a: natives KDE-Plasma-Wayland-Backend (KWin D-Bus)
 
 use crate::models::{Shortcut, WindowId, WindowInfo};
 use crossbeam_channel::Sender;
@@ -55,12 +55,6 @@ pub trait WindowBackend: Send + Sync {
     fn grab_hotkey_for_window(&self, shortcut: &Shortcut, _window_id: WindowId) -> Result<(), BackendError> {
         self.grab_hotkey(shortcut)
     }
-
-    /// true wenn das Backend Hotkey-Events über `BackendEvent::KeyPress`
-    /// (X11-Keycode + Modifier-Maske) liefert. false z.B. beim KDE-Wayland-
-    /// Backend, das stattdessen benannte Shortcuts über KWin GlobalShortcuts
-    /// nutzt und Auslösungen als `BackendEvent::ShortcutTriggered(id)` meldet.
-    fn uses_x11_keycodes(&self) -> bool { true }
 
     /// Phase 3a: Löst den in `ShortcutTriggered` gemeldeten Namen zur
     /// Ziel-Fenster-ID auf. Nur für Backends relevant, die Auslösungen

@@ -59,8 +59,9 @@ fn variant_bool(v: Option<&Variant<Box<dyn RefArg>>>) -> bool {
 }
 
 /// Ein bei KWin registrierter globaler Shortcut (temporär, nur im RAM).
+/// Der eindeutige Name ist zugleich der Schlüssel der HashMap, deshalb wird
+/// er hier nicht zusätzlich als Feld gespeichert.
 struct RegisteredShortcut {
-    name: String,       // eindeutiger Name in unserer Collection
     shortcut: Shortcut, // zum Matching in ungrab_hotkey
     window_id: WindowId,
 }
@@ -236,8 +237,7 @@ impl KdeWaylandBackend {
             self.unregister_action(&name);
             guard = self.shortcuts.lock().unwrap_or_else(|e| e.into_inner());
         }
-        let entry_name = name.clone();
-        guard.insert(name, RegisteredShortcut { name: entry_name, shortcut: shortcut.clone(), window_id });
+        guard.insert(name, RegisteredShortcut { shortcut: shortcut.clone(), window_id });
         Ok(())
     }
 
@@ -416,8 +416,6 @@ impl WindowBackend for KdeWaylandBackend {
             let _ = h.join();
         }
     }
-
-    fn uses_x11_keycodes(&self) -> bool { false }
 }
 
 impl Drop for KdeWaylandBackend {
